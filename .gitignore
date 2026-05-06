@@ -30,3 +30,25 @@ tests/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+node_modules/
+dist/
+build/
+coverage/
+.next/
+target/
+bin/
+obj/
+*.pyc
+.tox/
+.env.example
+app/api/webhook.py
+app/bot/handlers.py
+app/bot/main.py
+app/core/config.py
+app/core/security.py
+app/main.py
+app/models/all_models.py
+app/services/background_tasks.py
+app/services/instagram_service.py
+app/services/reply_engine.py
+docker-compose.yml
