@@ -1,66 +1,70 @@
-# IG Reply Desk
+# Insta Ai Res
 
-IG Reply Desk is a backend service for Instagram automation.
-It receives Meta webhook events, moves outgoing work into Redis queues, and gives operators clear controls through Telegram.
+A Python project maintained in the `imedkablavi/insta_ai_res` repository.
 
-The goal is simple: keep replies reliable under load, while still giving the team operational control.
+## Features
 
-## Project identity
+- Application routes or app code are organized under `app/`.
+- Dockerfile is included for container-based workflows.
+- Docker Compose configuration is included.
 
-- Repository name: ig-reply-desk
-- One-line description: Instagram webhook and auto-reply backend with Redis queues, worker controls, and Telegram operations.
-- GitHub About text: FastAPI backend for Instagram webhooks, queued replies, and operator workflows via Telegram.
-- Suggested topics: fastapi, instagram, webhook, automation, redis, postgres, telegram-bot, worker-queue, backend
+## Tech Stack
 
-## What this service does
+- Python
+- Docker
+- Docker Compose
 
-- Receives Instagram events from Meta webhooks
-- Queues reply jobs in Redis instead of sending inline
-- Processes jobs through workers for better stability and throughput
-- Exposes operator actions and safety controls in Telegram
+## Project Structure
 
-## Main folders
-
-- `app/api/`: webhook endpoints
-- `app/services/`: reply engine, worker orchestration, account settings
-- `app/bot/`: Telegram commands and interaction flows
-- `app/routers/ops.py`: health and operational endpoints
-- `docker-compose.yml`: local app + Postgres + Redis stack
-
-## Local setup
-
-1. Create `.env` from `.env.example`.
-2. Fill all required Meta and Telegram credentials.
-3. Start the stack:
-
-```bash
-docker compose up --build
+```text
+.env.example
+.gitignore
+alembic/
+alembic.ini
+app/
+docker-compose.yml
+Dockerfile
+README.md
+requirements.txt
+RUNBOOK.md
 ```
 
-Service URL:
+## Installation
 
-`http://localhost:8000`
+```bash
+python -m pip install -r requirements.txt
+```
 
-## Useful endpoints
+## Development
 
-- `GET /health`: basic service health
-- `GET /ops/status`: worker and queue status
-- `GET /instagram/webhook`: Meta verification endpoint
-- `POST /instagram/webhook`: incoming Instagram webhook events
+- Run the project entry point documented in the source files.
 
-## Security hardening checklist
+## Build
 
-- Verify webhook signatures on every incoming Meta event.
-- Keep tokens and secrets only in environment variables (never in source control).
-- Rotate Meta and Telegram tokens on a fixed schedule.
-- Use least-privilege access for DB, Redis, and bot credentials.
-- Add rate limiting on public webhook routes.
-- Log events without leaking PII or credential values.
-- Restrict `/ops/*` endpoints behind authentication and role checks.
+No build command was detected from tracked files.
 
-## Operational notes
+## Tests
 
-- Local startup creates required database tables.
-- Redis and Postgres must be healthy before handling production traffic.
-- Environment files, logs, and local artifacts are intentionally excluded from Git.
-- Documentation has been refreshed to improve operational clarity and security guidance.
+No test command was detected from tracked files.
+
+## Environment Variables
+
+Use `.env.example` as the starting point when environment variables are required. Keep real secrets out of git.
+
+- No required environment variables were detected from tracked files.
+
+## Status
+
+- README generated from the current repository files.
+- Runtime behavior should be verified in the target environment before production use.
+
+## Roadmap / TODO
+
+- Keep this README aligned with future code changes.
+- Add setup notes for deployment environments when they are finalized.
+- Add or expand automated tests when project behavior is stable.
+
+## Author
+
+Author: iEmmAd / cybrex  
+GitHub: [imedkablavi](https://github.com/imedkablavi)
