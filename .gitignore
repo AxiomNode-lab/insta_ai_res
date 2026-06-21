@@ -45,3 +45,15 @@ obj/
 !.env.*.sample
 !.env.template
 !.env.*.template
+
+# Local secrets and generated files
+*.pem
+*.key
+id_rsa
+id_ed25519
+credentials.json
+token.json
+secrets.json
+serviceAccount*.json
+firebase-adminsdk*.json
+**pycache**/
