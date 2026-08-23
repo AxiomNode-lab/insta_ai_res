@@ -81,8 +81,8 @@ def run_worker_pool_process(worker_id: int, stop_event: multiprocessing.Event):
                 if not worked:
                     await asyncio.sleep(0.5) # Avoid busy loop if queues empty
                     
-            except Exception as e:
-                local_logger.error(f"Worker loop error: {e}")
+            except Exception as exc:
+                local_logger.error("Worker loop error_type=%s", type(exc).__name__)
                 await asyncio.sleep(1.0)
                 
     try:
@@ -131,8 +131,8 @@ class WorkerPoolManager:
 
                 await asyncio.sleep(5.0)
                 
-            except Exception as e:
-                logger.error(f"Manager loop error: {e}")
+            except Exception as exc:
+                logger.error("Manager loop failed error_type=%s", type(exc).__name__)
                 await asyncio.sleep(5.0)
 
     def spawn_worker(self, worker_id: int):
@@ -162,4 +162,4 @@ class WorkerPoolManager:
                     p.terminate()
         logger.info("Worker Pool Manager Stopped.")
 
-worker_pool = WorkerPoolManager()
+worker_pool = WorkerPoolManager(pool_size=settings.WORKER_POOL_SIZE)

@@ -1,10 +1,21 @@
-from fastapi import APIRouter, Request, HTTPException, Response, Depends, BackgroundTasks
-from app.core.config import settings
-from app.core.security import verify_meta_signature
-from app.services.instagram_service import process_webhook_payload
-from app.core.redis_utils import get_redis_client
+import hashlib
+import hmac
+import json
 import logging
 import time
+
+from fastapi import APIRouter, Request, HTTPException, Response, status
+from redis.exceptions import RedisError
+
+from app.core.config import settings
+from app.core.rate_limit import (
+    public_rate_limit,
+    webhook_ingress_rate_limit,
+    webhook_rate_limit,
+)
+from app.core.security import verify_meta_signature
+from app.core.redis_utils import get_redis_client
+from app.services.webhook_queue import enqueue_verified_webhook
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -14,13 +25,15 @@ async def verify_webhook(request: Request):
     """
     Verification endpoint for Instagram Webhook (Hub Challenge).
     """
+    await public_rate_limit(request)
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
     
     if mode and token:
-        if mode == "subscribe" and token == settings.META_VERIFY_TOKEN:
+        token_valid = hmac.compare_digest(token, settings.META_VERIFY_TOKEN)
+        if mode == "subscribe" and token_valid:
             logger.info("Webhook verified successfully.")
             return Response(content=challenge, media_type="text/plain")
         else:
@@ -30,32 +43,55 @@ async def verify_webhook(request: Request):
     raise HTTPException(status_code=400, detail="Missing parameters")
 
 @router.post("/webhook")
-async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+async def handle_webhook(request: Request):
     """
     Receives webhook events from Instagram.
     """
-    # 1. Update Heartbeat (Redis)
-    try:
-        redis = await get_redis_client()
-        await redis.set("last_webhook_ts", str(time.time()))
-    except Exception as e:
-        logger.error(f"Failed to update heartbeat: {e}")
+    # This intentionally precedes authentication: it bounds the aggregate work
+    # required to buffer and authenticate forged requests.
+    await webhook_ingress_rate_limit(request)
 
-    # 2. Get Raw Body and Signature
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > settings.MAX_WEBHOOK_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="Webhook body too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+
+    # Signature verification is deliberately the first operation that uses body data.
     body_bytes = await request.body()
+    if len(body_bytes) > settings.MAX_WEBHOOK_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook body too large")
     signature = request.headers.get("X-Hub-Signature-256")
-    
-    # 3. Verify Signature
     if not verify_meta_signature(body_bytes, signature):
-        logger.error("Invalid signature.")
+        logger.warning("Rejected webhook with invalid signature")
         raise HTTPException(status_code=403, detail="Invalid signature")
-        
-    # 4. Process Event (Background Task to return 200 OK quickly)
+
+    await webhook_rate_limit(request)
+
     try:
-        payload = await request.json()
-        background_tasks.add_task(process_webhook_payload, payload)
-        return Response(content="EVENT_RECEIVED", status_code=200)
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        # Still return 200 to Meta to avoid retries on bad payload
-        return Response(content="EVENT_RECEIVED", status_code=200)
+        payload = json.loads(body_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+    if not isinstance(payload, dict) or payload.get("object") != "instagram":
+        raise HTTPException(status_code=400, detail="Unsupported webhook payload")
+
+    delivery_id = hashlib.sha256(body_bytes).hexdigest()
+    try:
+        result = await enqueue_verified_webhook(delivery_id, payload)
+        redis = await get_redis_client()
+        await redis.set("last_webhook_ts", str(time.time()), ex=86_400)
+    except RedisError as exc:
+        logger.warning("Webhook inbox unavailable error_type=%s", type(exc).__name__)
+        # A retryable response prevents an acknowledged-but-lost Meta delivery.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook inbox unavailable",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    response = Response(content="EVENT_RECEIVED", status_code=200)
+    response.headers["X-Webhook-Duplicate"] = "1" if result.duplicate else "0"
+    return response

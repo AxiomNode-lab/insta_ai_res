@@ -1,4 +1,6 @@
 import httpx
+import hashlib
+import html
 import logging
 import asyncio
 import random
@@ -8,7 +10,9 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.security import generate_appsecret_proof, decrypt_token
 from app.core.redis_utils import (
-    is_event_processed, 
+    claim_event,
+    complete_event,
+    release_event,
     is_rate_limited, 
     check_account_limits,
     is_account_quarantined,
@@ -18,6 +22,9 @@ from app.core.redis_utils import (
     is_within_24h_window,
     enqueue_message,
     get_next_message_from_queue,
+    claim_outbound_message,
+    acknowledge_outbound_message,
+    retry_outbound_message,
     acquire_queue_lock,
     move_to_dead_letter,
     acquire_conversation_lock,
@@ -37,7 +44,7 @@ from app.core.redis_utils import (
     is_trust_recovery_mode,
     record_bot_like_start
 )
-from app.models.all_models import User, Message, MessageDirection, Account, ActivityEvent, LastProcessedEvent, Conversation
+from app.models.all_models import User, Message, MessageDirection, Account, ActivityEvent, Conversation
 from app.services.reply_engine import get_auto_reply, normalize_arabic
 from app.services.account_settings import (
     find_comment_dm_match,
@@ -57,6 +64,10 @@ logger = logging.getLogger(__name__)
 GRAPH_API_URL = "https://graph.facebook.com/v19.0"
 
 
+class DeliveryPolicyBlocked(RuntimeError):
+    pass
+
+
 def _truncate_log_text(text: str, limit: int = 300) -> str:
     cleaned = " ".join((text or "").split())
     if len(cleaned) <= limit:
@@ -65,7 +76,12 @@ def _truncate_log_text(text: str, limit: int = 300) -> str:
 
 
 def _format_http_error(response: httpx.Response) -> str:
-    return f"status={response.status_code}, body={_truncate_log_text(response.text)}"
+    error_code = "unknown"
+    try:
+        error_code = str(response.json().get("error", {}).get("code", "unknown"))
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return f"status={response.status_code}, meta_error_code={error_code}"
 
 def analyze_reply_risk(text: str, user: User) -> tuple[str, str]:
     """
@@ -103,15 +119,19 @@ async def notify_live_chat(account_id: int, sender_id: str, text: str, user_name
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 رد (Live Chat)", callback_data=f"reply_to:{account_id}:{sender_id}")]
         ])
-        msg = f"📩 <b>رسالة جديدة من العميل (Account {account_id})</b>\n\n👤: {user_name} (ID: {sender_id})\n📄: {text}"
+        msg = (
+            f"📩 <b>رسالة جديدة من العميل (Account {account_id})</b>\n\n"
+            f"👤: {html.escape(user_name)} (ID: {html.escape(sender_id)})\n"
+            f"📄: {html.escape(text)}"
+        )
         for admin_id in settings.ADMIN_IDS:
             try:
                 await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML", reply_markup=keyboard)
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin_id}: {e}")
+            except Exception as exc:
+                logger.error("Failed to notify admin error_type=%s", type(exc).__name__)
         await bot.session.close()
-    except Exception as e:
-        logger.error(f"Live Chat Notification Error: {e}")
+    except Exception as exc:
+        logger.error("Live chat notification failed error_type=%s", type(exc).__name__)
 
 # --- Worker Logic (Reliability Enhanced) ---
 async def process_outgoing_queue(account_id: int = None, stop_event: Event = None, single_pass: bool = False) -> int:
@@ -153,7 +173,7 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
             from app.core.redis_utils import get_redis_client
             redis = await get_redis_client()
             queue_key = f"queue:{account_id}"
-            data = await redis.lpop(queue_key)
+            data = await claim_outbound_message(account_id)
             
             if data:
                 processed_count += 1
@@ -165,17 +185,18 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                 
                 # Isolation Check
                 if msg_account_id and int(msg_account_id) != int(account_id):
-                    logger.critical(f"Security Alert: Cross-Account Leak! Expected {account_id}, got {msg_account_id}")
+                    logger.critical("Security alert: cross-account queue payload rejected")
+                    await retry_outbound_message(
+                        account_id, data, msg_data, "CrossAccountPayload", max_attempts=1
+                    )
                     continue
                 
                 # --- 5) Emergency Account Isolation Check ---
                 if await is_account_locked(account_id):
-                    logger.warning(f"Account {account_id} is in LOCKDOWN. Skipping message to {recipient_id}.")
-                    # Should we DLQ it? Or just re-queue?
-                    # Re-queueing might cause loop. DLQ is safer for "stuck" state.
-                    # Or just drop if it's an emergency? 
-                    # Let's push to DLQ to be safe.
-                    await move_to_dead_letter(account_id, msg_data, "Account Lockdown Active")
+                    logger.warning("Account is in lockdown account=%s", account_id)
+                    await retry_outbound_message(
+                        account_id, data, msg_data, "AccountLockdown", max_attempts=1
+                    )
                     continue
 
                 if delay > 0:
@@ -185,69 +206,78 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                 async with AsyncSessionLocal() as session:
                     account = await session.get(Account, account_id)
                     if not account:
+                        await retry_outbound_message(
+                            account_id, data, msg_data, "AccountUnavailable"
+                        )
                         continue
                     # Decrypt Token
                     try:
                         token = decrypt_token(account.id, account.access_token)
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt token for account {account_id}: {e}")
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to decrypt account token account=%s error_type=%s",
+                            account_id,
+                            type(exc).__name__,
+                        )
+                        await retry_outbound_message(
+                            account_id, data, msg_data, type(exc).__name__
+                        )
                         continue
                         
                 # Reliability: Conversation Lock
-                if not await acquire_conversation_lock(recipient_id):
-                    # Locked, push back to queue head or tail?
-                    # Pushing back to head preserves order mostly but might loop.
-                    # Wait and retry?
-                    # Let's push back to head and sleep briefly.
-                    await redis.lpush(queue_key, data)
-                    await asyncio.sleep(1.0)
+                conversation_lock_token = await acquire_conversation_lock(account_id, recipient_id)
+                if not conversation_lock_token:
+                    await retry_outbound_message(
+                        account_id, data, msg_data, "ConversationBusy"
+                    )
                     if single_pass: return processed_count
                     continue
 
                 try:
-                    # Retry Policy
-                    retries = [0, 5, 30, 120] # Delays
-                    success = False
-                    
-                    for i, delay in enumerate(retries):
-                        if i > 0:
-                            logger.info(f"Retry {i}/{len(retries)} for {recipient_id} in {delay}s...")
-                            await asyncio.sleep(delay)
-                        
-                        try:
-                            # Send
-                            await send_instagram_message_api(recipient_id, text, token)
-                            success = True
-                            break
-                        except Exception as e:
-                            logger.warning(f"Send failed (Attempt {i+1}): {e}")
-                    
-                    if not success:
-                        logger.error(f"Message to {recipient_id} failed after retries. Moving to DLQ.")
-                        await move_to_dead_letter(account_id, msg_data, "Max retries exceeded")
-                        
-                        # Log Activity (Failed)
+                    try:
+                            await send_instagram_message_api(account_id, recipient_id, text, token)
+                    except DeliveryPolicyBlocked:
+                        await retry_outbound_message(
+                            account_id, data, msg_data, "DeliveryPolicyBlocked", max_attempts=1
+                        )
+                        logger.warning(
+                            "Outbound message terminally blocked account=%s recipient=%s",
+                            account_id,
+                            _safe_subject(recipient_id),
+                        )
+                    except Exception as exc:
+                        terminal = await retry_outbound_message(
+                            account_id, data, msg_data, type(exc).__name__
+                        )
+                        logger.warning(
+                            "Outbound delivery failed account=%s recipient=%s terminal=%s error_type=%s",
+                            account_id,
+                            _safe_subject(recipient_id),
+                            terminal,
+                            type(exc).__name__,
+                        )
                         async with AsyncSessionLocal() as session:
                             event = ActivityEvent(
                                 account_id=account_id,
                                 event_type="MESSAGE_FAILED",
-                                details=f"To: {recipient_id} - Max retries"
+                                details=f"recipient={_safe_subject(recipient_id)} error={type(exc).__name__}",
                             )
                             session.add(event)
                             await session.commit()
                     else:
+                        await acknowledge_outbound_message(account_id, data)
                         # Log Activity (Success)
                         async with AsyncSessionLocal() as session:
                             event = ActivityEvent(
                                 account_id=account_id,
                                 event_type="AUTO_REPLY",
-                                details=f"To: {recipient_id}"
+                                details=f"recipient={_safe_subject(recipient_id)}"
                             )
                             session.add(event)
                             await session.commit()
                             
                 finally:
-                    await release_conversation_lock(recipient_id)
+                    await release_conversation_lock(account_id, recipient_id, conversation_lock_token)
                 
                 if single_pass:
                     # In single pass (worker pool), we might process just one or a small batch
@@ -259,17 +289,17 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                 if single_pass:
                     return processed_count
                 await asyncio.sleep(1.0)
-        except Exception as e:
-            logger.error(f"Worker Error: {e}")
+        except Exception as exc:
+            logger.error("Worker error account=%s error_type=%s", account_id, type(exc).__name__)
             if single_pass: return processed_count
             await asyncio.sleep(1.0)
     return processed_count
 
-async def send_instagram_message_api(recipient_id: str, text: str, access_token: str):
+async def send_instagram_message_api(account_id: int, recipient_id: str, text: str, access_token: str):
     url = f"{GRAPH_API_URL}/me/messages"
     
-    is_within = await is_within_24h_window(recipient_id)
-    is_human_mode = await is_human_takeover_active(recipient_id)
+    is_within = await is_within_24h_window(account_id, recipient_id)
+    is_human_mode = await is_human_takeover_active(account_id, recipient_id)
     
     payload = {
         "recipient": {"id": recipient_id},
@@ -286,11 +316,9 @@ async def send_instagram_message_api(recipient_id: str, text: str, access_token:
         # is_within_24h_window means "did user send msg in last 24h".
         # If is_within is False, it means user hasn't sent msg in last 24h.
         # So we strictly block if !is_within.
-        logger.warning(f"Blocked message to {recipient_id}: Outside 24h window (Strict Compliance).")
-        return
+        raise DeliveryPolicyBlocked("Outside24HourWindow")
     else:
-        logger.warning(f"Blocked message to {recipient_id}: Outside 24h window and not in Human Mode.")
-        return
+        raise DeliveryPolicyBlocked("Outside24HourWindow")
 
     params = {
         "access_token": access_token,
@@ -301,14 +329,14 @@ async def send_instagram_message_api(recipient_id: str, text: str, access_token:
         try:
             response = await client.post(url, params=params, json=payload)
             response.raise_for_status()
-            logger.info(f"Message sent to {recipient_id}: {text[:20]}...")
+            logger.info("Message sent recipient=%s", _safe_subject(recipient_id))
             # --- Track Outgoing for Silence Detection ---
             from app.core.redis_utils import track_outgoing_message
             await track_outgoing_message(1)
             return response.json()
         except httpx.HTTPStatusError as e:
             error_message = _format_http_error(e.response)
-            logger.error(f"Failed to send message: {error_message}")
+            logger.error("Meta send failed %s", error_message)
             if e.response.status_code == 429:
                 logger.warning("Rate limit hit!")
             raise RuntimeError(error_message) from e
@@ -319,67 +347,58 @@ async def send_instagram_message_api(recipient_id: str, text: str, access_token:
 # --- Webhook Logic (Reliability: Replay Recovery) ---
 
 async def process_webhook_payload(payload: dict):
-    try:
-        for entry in payload.get("entry", []):
-            page_id = entry.get("id")
-            
-            async with AsyncSessionLocal() as session:
-                account = await get_account_by_page_id(session, page_id)
-                if not account:
-                    logger.warning(f"Webhook received for unknown Page ID: {page_id}")
-                    continue
-                
-                # Check Quarantine
-                if await is_account_quarantined(account.id):
-                    continue
+    for entry in payload.get("entry", []):
+        page_id = entry.get("id")
 
-                # Process messaging events for this account
-                for event in entry.get("messaging", []):
-                    # Reliability: Replay Recovery Check
-                    timestamp = event.get("timestamp")
-                    if timestamp:
-                        # Check last processed timestamp from DB
-                        # We use LastProcessedEvent table (Phase 5 requirement 4)
-                        # Load last processed
-                        # We can cache this in Redis too for speed, but Requirement says "Persistent" (DB).
-                        # Let's check DB.
-                        
-                        stmt = select(LastProcessedEvent).where(LastProcessedEvent.account_id == account.id)
-                        res = await session.execute(stmt)
-                        last_event = res.scalar_one_or_none()
-                        
-                        if last_event and int(timestamp) <= int(last_event.last_timestamp):
-                            logger.info(f"Skipping replayed event {timestamp} for Account {account.id}")
-                            continue
-                            
-                        # Update Last Timestamp
-                        if not last_event:
-                            last_event = LastProcessedEvent(account_id=account.id, last_timestamp=str(timestamp))
-                            session.add(last_event)
-                        else:
-                            last_event.last_timestamp = str(timestamp)
-                        await session.commit()
-                    
-                    await process_single_event(event, account, session)
-                    
-                    # --- Track Incoming for Silence Detection ---
-                    from app.core.redis_utils import track_incoming_message
-                    # Count user messages only (not echos/deliveries if possible, but payload structure varies)
-                    # process_single_event handles logic, but here we count RAW ingress events
-                    # We should count only if it's a message?
-                    # event.get("message") check
-                    if event.get("message") and not event.get("message", {}).get("is_echo"):
-                        await track_incoming_message(1)
+        async with AsyncSessionLocal() as session:
+            account = await get_account_by_page_id(session, page_id)
+            if not account:
+                logger.warning("Webhook received for unknown page page=%s", _safe_subject(page_id))
+                continue
 
-                # Process comment change events (keyword comment -> private DM)
-                for change in entry.get("changes", []):
-                    await process_comment_change(change, account, session)
-                    
-    except Exception as e:
-        logger.error(f"Error processing payload: {e}")
+            if await is_account_quarantined(account.id):
+                continue
+
+            for event in entry.get("messaging", []):
+                await process_single_event(event, account, session)
+
+                from app.core.redis_utils import track_incoming_message
+
+                if event.get("message") and not event.get("message", {}).get("is_echo"):
+                    await track_incoming_message(1)
+
+            for change in entry.get("changes", []):
+                await process_comment_change(change, account, session)
+
+
+class EventAlreadyProcessing(RuntimeError):
+    pass
+
+
+def _safe_subject(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
 
 
 async def process_comment_change(change: dict, account: Account, session: AsyncSession):
+    value = change.get("value") or {}
+    comment_id = value.get("id") or value.get("comment_id")
+    if not comment_id:
+        return
+    event_id = f"comment:{account.id}:{comment_id}"
+    state, token = await claim_event(event_id)
+    if state == "complete":
+        return
+    if state == "busy" or not token:
+        raise EventAlreadyProcessing(event_id)
+    try:
+        await _process_comment_change(change, account, session)
+        await complete_event(event_id, token)
+    except Exception:
+        await release_event(event_id, token)
+        raise
+
+
+async def _process_comment_change(change: dict, account: Account, session: AsyncSession):
     if change.get("field") != "comments":
         return
 
@@ -398,17 +417,13 @@ async def process_comment_change(change: dict, account: Account, session: AsyncS
     if media_product_type not in {"VIDEO", "REELS", "IGTV"}:
         return
 
-    dedup_id = f"comment_{account.id}_{comment_id}"
-    if await is_event_processed(dedup_id):
-        return
-
     rules = await get_comment_dm_rules(session, account.id)
     matched_keyword, reply_text = find_comment_dm_match(rules, comment_text)
     if not reply_text:
         return
 
     # Comment itself is treated as a fresh user interaction to pass local 24h window guard.
-    await update_last_interaction(commenter_id, timestamp=int(time.time()))
+    await update_last_interaction(account.id, commenter_id, timestamp=int(time.time()))
     await enqueue_message(commenter_id, reply_text, account.id, delay=random.uniform(2, 8))
 
     user = await get_or_create_user(session, commenter_id, account.id, send_welcome=False)
@@ -431,7 +446,27 @@ async def process_comment_change(change: dict, account: Account, session: AsyncS
     await session.commit()
 
 async def process_single_event(event: dict, account: Account, session: AsyncSession):
-    # (Same logic as before, just ensured it's called after Replay Check)
+    message = event.get("message") or {}
+    stable_id = message.get("mid")
+    if not stable_id:
+        stable_id = hashlib.sha256(
+            json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    event_id = f"message:{account.id}:{stable_id}"
+    state, token = await claim_event(event_id)
+    if state == "complete":
+        return
+    if state == "busy" or not token:
+        raise EventAlreadyProcessing(event_id)
+    try:
+        await _process_single_event(event, account, session)
+        await complete_event(event_id, token)
+    except Exception:
+        await release_event(event_id, token)
+        raise
+
+
+async def _process_single_event(event: dict, account: Account, session: AsyncSession):
     sender_id = event.get("sender", {}).get("id")
     recipient_id = event.get("recipient", {}).get("id")
     timestamp = event.get("timestamp")
@@ -440,14 +475,9 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
     text = message.get("text")
     is_echo = message.get("is_echo", False)
     
-    event_id = f"{timestamp}_{sender_id}_{mid or 'nomid'}"
-
-    if await is_event_processed(event_id):
-        return
-
     if is_echo:
         if recipient_id:
-            await set_human_takeover(recipient_id, active=True)
+            await set_human_takeover(account.id, recipient_id, active=True)
             log = ActivityEvent(account_id=account.id, event_type="HUMAN_INTERVENTION", details=f"Admin replied to {recipient_id}")
             session.add(log)
             await session.commit()
@@ -466,26 +496,26 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
         return
 
     if not text:
-        await update_last_interaction(sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
         return
         
     clean_text = re.sub(r'[^\w\s]', '', text).strip()
     if len(clean_text) <= 2:
-        await update_last_interaction(sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
         return
         
     # --- 5) Follow-Up Cooldown Logic ---
     text_hash = str(hash(clean_text))
-    if await check_follow_up_cooldown(sender_id, text_hash):
+    if await check_follow_up_cooldown(account.id, sender_id, text_hash):
         # User repeated message < 30s.
         # Don't reply immediately. Just ignore or delay?
         # Prompt says: "Don't repeat reply. Wait 20-40s before next reply."
         # If we return here, we ignore it.
         # Let's log and ignore to avoid loop.
-        logger.info(f"Follow-Up Cooldown: Ignoring repeated message from {sender_id}")
+        logger.info("Follow-up cooldown sender=%s", _safe_subject(sender_id))
         return
 
-    is_human_mode = await is_human_takeover_active(sender_id)
+    is_human_mode = await is_human_takeover_active(account.id, sender_id)
     
     # --- 1) Human Mode Auto-Recovery ---
     if is_human_mode:
@@ -497,12 +527,12 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
         # We need "last_admin_reply_time".
         from app.core.redis_utils import get_redis_client
         redis = await get_redis_client()
-        last_admin_ts = await redis.get(f"last_admin_reply:{sender_id}")
+        last_admin_ts = await redis.get(f"last_admin_reply:{account.id}:{sender_id}")
         
         if last_admin_ts:
             elapsed = int(time.time()) - int(last_admin_ts)
             if elapsed > 900: # 15 mins
-                await set_human_takeover(sender_id, False)
+                await set_human_takeover(account.id, sender_id, False)
                 is_human_mode = False
                 
                 # Update User DB
@@ -523,7 +553,7 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
              pass
 
     if is_human_mode:
-        await update_last_interaction(sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
         user = await get_or_create_user(session, sender_id, account.id)
         # --- User-Visible Diagnostics ---
         user.last_reply_status = "HUMAN_MODE_ACTIVE"
@@ -548,8 +578,8 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
     should_escalate = any(kw in normalized_text for kw in escalation_keywords)
     
     if should_escalate:
-        await set_human_takeover(sender_id, active=True)
-        await update_last_interaction(sender_id, timestamp=int(timestamp) if timestamp else None)
+        await set_human_takeover(account.id, sender_id, active=True)
+        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
         
         user = await get_or_create_user(session, sender_id, account.id)
         user.is_paused = True
@@ -563,7 +593,7 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
         await notify_live_chat(account.id, sender_id, text, user.full_name or "User")
         return
 
-    if await is_rate_limited(sender_id):
+    if await is_rate_limited(account.id, sender_id):
         user = await get_or_create_user(session, sender_id, account.id)
         user.last_reply_status = "RATE_LIMITED"
         session.add(user)
@@ -580,7 +610,7 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
         await session.commit()
         return
 
-    await update_last_interaction(sender_id, timestamp=int(timestamp) if timestamp else None)
+    await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
 
     user = await get_or_create_user(session, sender_id, account.id)
     
@@ -661,7 +691,7 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
             
             # Increase Human Escalation
             if random.random() < 0.2: # 20% chance to force human
-                await set_human_takeover(sender_id, True)
+                await set_human_takeover(account.id, sender_id, True)
                 # Notify
                 log = ActivityEvent(account_id=account.id, event_type="ADAPTIVE_CONTROL", details="Forced Human Mode due to Bot-Like Behavior")
                 session.add(log)
@@ -729,10 +759,10 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
         if await check_conversation_diversity(account.id, str(struct_hash)):
             # Escalation
             if random.random() < 0.3:
-                 await set_human_takeover(sender_id, True)
+                 await set_human_takeover(account.id, sender_id, True)
                  return
 
-        lock_key = f"outgoing:{sender_id}:{hash(reply_text)}"
+        lock_key = f"outgoing:{account.id}:{sender_id}:{hash(reply_text)}"
         if await acquire_queue_lock(lock_key):
             try:
                 # --- 4) Random Response Timing ---
@@ -806,10 +836,10 @@ async def process_single_event(event: dict, account: Account, session: AsyncSess
                 user.last_reply_status = "REPLIED"
                 session.add(user)
                 await session.commit()
-            except Exception as e:
-                logger.error(f"Failed to enqueue reply: {e}")
+            except Exception as exc:
+                logger.error("Failed to enqueue reply error_type=%s", type(exc).__name__)
         else:
-            logger.warning(f"Duplicate reply prevented to {sender_id}")
+            logger.warning("Duplicate reply prevented sender=%s", _safe_subject(sender_id))
     else:
         user.last_reply_status = "INTENT_NOT_DETECTED"
         session.add(user)
@@ -864,5 +894,3 @@ async def get_or_create_user(
             await enqueue_message(ig_id, owner_texts["welcome_text"], account_id)
         
     return user
-
-

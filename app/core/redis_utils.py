@@ -2,15 +2,27 @@ import redis.asyncio as redis
 from app.core.config import settings
 import json
 import time
+import uuid
 
 # --- Scalability: Global Connection Pool ---
 # Global Redis Pool Singleton
 _redis_pool = None
 
+
+class QueueBackpressure(RuntimeError):
+    pass
+
 async def init_redis_pool():
     global _redis_pool
     if _redis_pool is None:
-        _redis_pool = redis.ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True, max_connections=100)
+        _redis_pool = redis.ConnectionPool.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            max_connections=100,
+            socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+            health_check_interval=30,
+        )
 
 async def close_redis_pool():
     global _redis_pool
@@ -29,6 +41,61 @@ async def is_event_processed(event_id: str, expiration: int = 86400) -> bool:
     key = f"event_processed:{event_id}"
     success = await client.set(key, "1", ex=expiration, nx=True)
     return not success
+
+
+async def claim_event(event_id: str) -> tuple[str, str | None]:
+    """Return (claimed|complete|busy, token)."""
+    client = await get_redis_client()
+    key = f"event_processed:{event_id}"
+    token = uuid.uuid4().hex
+    claimed = await client.set(
+        key,
+        f"processing:{token}",
+        ex=settings.WEBHOOK_PROCESSING_LEASE_SECONDS,
+        nx=True,
+    )
+    if claimed:
+        return "claimed", token
+    value = await client.get(key)
+    return ("complete", None) if value == "complete" else ("busy", None)
+
+
+async def complete_event(event_id: str, token: str) -> bool:
+    client = await get_redis_client()
+    script = """
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      redis.call('SET', KEYS[1], 'complete', 'EX', ARGV[2])
+      return 1
+    end
+    return 0
+    """
+    return bool(
+        await client.eval(
+            script,
+            1,
+            f"event_processed:{event_id}",
+            f"processing:{token}",
+            settings.WEBHOOK_DEDUP_TTL_SECONDS,
+        )
+    )
+
+
+async def release_event(event_id: str, token: str) -> bool:
+    client = await get_redis_client()
+    script = """
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+    """
+    return bool(
+        await client.eval(
+            script,
+            1,
+            f"event_processed:{event_id}",
+            f"processing:{token}",
+        )
+    )
 
 # --- Global Behaviour Monitor ---
 async def record_global_behavior(response_time: float, is_human: bool = False, is_ignored: bool = False):
@@ -130,9 +197,9 @@ async def is_global_protection_active() -> bool:
     return await client.exists("global_protection_mode")
 
 # --- Rate Limiting (User Level) ---
-async def is_rate_limited(user_id: str, limit: int = 5, period: int = 60) -> bool:
+async def is_rate_limited(account_id: int, user_id: str, limit: int = 5, period: int = 60) -> bool:
     client = await get_redis_client()
-    key = f"rate_limit:{user_id}"
+    key = f"rate_limit:{account_id}:{user_id}"
     current = await client.incr(key)
     if current == 1:
         await client.expire(key, period)
@@ -152,9 +219,14 @@ async def get_account_load_status(account_id: int) -> str:
     # but for simplicity assume these keys are incremented and expired every second by caller or worker)
     # Actually simpler: Check Queue Size
     queue_key = f"queue:{account_id}"
-    queue_size = await client.llen(queue_key)
+    pipe = client.pipeline()
+    pipe.llen(queue_key)
+    pipe.zcard(f"queue:processing:{account_id}")
+    pipe.zcard(f"queue:retry:{account_id}")
+    ready, processing, retrying = await pipe.execute()
+    queue_size = int(ready) + int(processing) + int(retrying)
     
-    if queue_size > 1000:
+    if queue_size >= settings.OUTBOUND_QUEUE_MAX_DEPTH:
         return "CRITICAL"
     elif queue_size > 100:
         return "HIGH"
@@ -214,7 +286,8 @@ async def move_to_dead_letter(account_id: int, payload: dict, error_msg: str):
     """
     client = await get_redis_client()
     dlq_key = f"dead_letter:{account_id}"
-    payload["error"] = error_msg
+    payload = dict(payload)
+    payload["error_type"] = error_msg
     payload["failed_at"] = time.time()
     
     # Push new
@@ -226,6 +299,7 @@ async def move_to_dead_letter(account_id: int, payload: dict, error_msg: str):
     # List is: [oldest, ..., newest] (rpush)
     # So we want indices: -1000 to -1
     await client.ltrim(dlq_key, -1000, -1)
+    await client.expire(dlq_key, 2_592_000)
 
 # --- Metrics Collection ---
 async def record_metric(metric_name: str, account_id: int, value: float = 1):
@@ -325,29 +399,29 @@ async def set_account_quarantine(account_id: int, active: bool):
         await client.delete(key)
 
 # --- Human Takeover ---
-async def set_human_takeover(user_id: str, active: bool):
+async def set_human_takeover(account_id: int, user_id: str, active: bool):
     client = await get_redis_client()
-    key = f"human_mode:{user_id}"
+    key = f"human_mode:{account_id}:{user_id}"
     if active:
         await client.set(key, "1")
     else:
         await client.delete(key)
 
-async def is_human_takeover_active(user_id: str) -> bool:
+async def is_human_takeover_active(account_id: int, user_id: str) -> bool:
     client = await get_redis_client()
-    key = f"human_mode:{user_id}"
+    key = f"human_mode:{account_id}:{user_id}"
     return await client.exists(key)
 
 # --- 24h Window Management ---
-async def update_last_interaction(user_id: str, timestamp: int = None):
+async def update_last_interaction(account_id: int, user_id: str, timestamp: int = None):
     client = await get_redis_client()
-    key = f"last_interaction:{user_id}"
+    key = f"last_interaction:{account_id}:{user_id}"
     ts = timestamp if timestamp else int(time.time())
     await client.set(key, ts)
 
-async def is_within_24h_window(user_id: str, current_timestamp: int = None) -> bool:
+async def is_within_24h_window(account_id: int, user_id: str, current_timestamp: int = None) -> bool:
     client = await get_redis_client()
-    key = f"last_interaction:{user_id}"
+    key = f"last_interaction:{account_id}:{user_id}"
     last_time = await client.get(key)
     
     if not last_time:
@@ -369,20 +443,111 @@ async def enqueue_message(recipient_id: str, text: str, account_id: int, delay: 
     
     # Backpressure check
     if await check_throttling(account_id):
-        pass
+        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
 
     queue_key = f"queue:{account_id}"
     payload = json.dumps({
+        "job_id": uuid.uuid4().hex,
         "recipient_id": recipient_id, 
         "text": text, 
         "account_id": account_id,
-        "delay": delay
-    })
+        "delay": delay,
+        "attempt": 0,
+        "queued_at": time.time(),
+    }, separators=(",", ":"), sort_keys=True)
     
     pipe = client.pipeline()
     pipe.rpush(queue_key, payload)
     pipe.sadd(ACTIVE_ACCOUNTS_KEY, str(account_id))
     await pipe.execute()
+
+
+_CLAIM_OUTBOUND_SCRIPT = """
+local raw = redis.call('RPOP', KEYS[1])
+if not raw then
+  return false
+end
+redis.call('ZADD', KEYS[2], ARGV[1], raw)
+return raw
+"""
+
+_MOVE_OUTBOUND_DUE_SCRIPT = """
+local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+for _, raw in ipairs(members) do
+  if redis.call('ZREM', KEYS[1], raw) == 1 then
+    redis.call('LPUSH', KEYS[2], raw)
+  end
+end
+return #members
+"""
+
+
+async def recover_outbound_jobs(account_id: int, batch_size: int = 100) -> int:
+    client = await get_redis_client()
+    now = time.time()
+    queue_key = f"queue:{account_id}"
+    recovered = 0
+    for source in (f"queue:processing:{account_id}", f"queue:retry:{account_id}"):
+        recovered += int(
+            await client.eval(
+                _MOVE_OUTBOUND_DUE_SCRIPT,
+                2,
+                source,
+                queue_key,
+                now,
+                batch_size,
+            )
+        )
+    return recovered
+
+
+async def claim_outbound_message(account_id: int, lease_seconds: int = 300) -> str | None:
+    await recover_outbound_jobs(account_id)
+    client = await get_redis_client()
+    return await client.eval(
+        _CLAIM_OUTBOUND_SCRIPT,
+        2,
+        f"queue:{account_id}",
+        f"queue:processing:{account_id}",
+        time.time() + lease_seconds,
+    )
+
+
+async def acknowledge_outbound_message(account_id: int, raw: str) -> None:
+    client = await get_redis_client()
+    await client.zrem(f"queue:processing:{account_id}", raw)
+
+
+async def retry_outbound_message(
+    account_id: int,
+    raw: str,
+    payload: dict,
+    error_type: str,
+    max_attempts: int = 6,
+) -> bool:
+    """Schedule a bounded retry. Return True when moved to the terminal DLQ."""
+    client = await get_redis_client()
+    updated = dict(payload)
+    attempt = int(updated.get("attempt", 0)) + 1
+    updated["attempt"] = attempt
+    updated["last_error_type"] = error_type
+    updated["last_failed_at"] = time.time()
+    encoded = json.dumps(updated, separators=(",", ":"), sort_keys=True)
+
+    pipe = client.pipeline(transaction=True)
+    pipe.zrem(f"queue:processing:{account_id}", raw)
+    if attempt >= max_attempts:
+        dlq_key = f"dead_letter:{account_id}"
+        pipe.rpush(dlq_key, encoded)
+        pipe.ltrim(dlq_key, -1000, -1)
+        pipe.expire(dlq_key, 2_592_000)
+        terminal = True
+    else:
+        delay = min(5 * (2 ** (attempt - 1)), 300)
+        pipe.zadd(f"queue:retry:{account_id}", {encoded: time.time() + delay})
+        terminal = False
+    await pipe.execute()
+    return terminal
 
 async def get_next_message_from_queue() -> dict | None:
     client = await get_redis_client()
@@ -436,15 +601,23 @@ async def check_reply_repetition(account_id: int, text: str, max_limit: int = 50
     return current <= max_limit
 
 # --- Reliability: Conversation Lock ---
-async def acquire_conversation_lock(conversation_id: str, expiration: int = 10) -> bool:
+async def acquire_conversation_lock(account_id: int, conversation_id: str, expiration: int = 600) -> str | None:
     client = await get_redis_client()
-    key = f"lock:conversation:{conversation_id}"
-    return await client.set(key, "1", ex=expiration, nx=True)
+    key = f"lock:conversation:{account_id}:{conversation_id}"
+    token = uuid.uuid4().hex
+    acquired = await client.set(key, token, ex=expiration, nx=True)
+    return token if acquired else None
 
-async def release_conversation_lock(conversation_id: str):
+async def release_conversation_lock(account_id: int, conversation_id: str, token: str):
     client = await get_redis_client()
-    key = f"lock:conversation:{conversation_id}"
-    await client.delete(key)
+    key = f"lock:conversation:{account_id}:{conversation_id}"
+    script = """
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+    """
+    await client.eval(script, 1, key, token)
 
 async def record_unknown_intent(account_id: int, text: str) -> bool:
     """
@@ -467,9 +640,9 @@ async def record_unknown_intent(account_id: int, text: str) -> bool:
         
     return count == 5
 
-async def record_admin_reply(user_id: str):
+async def record_admin_reply(account_id: int, user_id: str):
     client = await get_redis_client()
-    key = f"last_admin_reply:{user_id}"
+    key = f"last_admin_reply:{account_id}:{user_id}"
     await client.set(key, int(time.time()))
 
 # --- Conversation Quality Engine ---
@@ -500,12 +673,12 @@ async def get_conversation_depth(conversation_id: int) -> dict:
         "bot_msgs": int(data.get("bot_msgs", 0))
     }
 
-async def check_follow_up_cooldown(user_id: str, text_hash: str) -> bool:
+async def check_follow_up_cooldown(account_id: int, user_id: str, text_hash: str) -> bool:
     """
     Returns True if user sent same message < 30s ago (Follow-Up Cooldown).
     """
     client = await get_redis_client()
-    key = f"follow_up_cooldown:{user_id}:{text_hash}"
+    key = f"follow_up_cooldown:{account_id}:{user_id}:{text_hash}"
     # setnx: set if not exists
     # If exists, return True (Cooldown active)
     # If not, set it and expire in 30s
@@ -653,5 +826,3 @@ async def set_account_lockdown(account_id: int, active: bool):
         await client.set(key, "1")
     else:
         await client.delete(key)
-
-

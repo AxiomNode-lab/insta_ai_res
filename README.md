@@ -1,66 +1,79 @@
 # IG Reply Desk
 
-IG Reply Desk is a backend service for Instagram automation.
-It receives Meta webhook events, moves outgoing work into Redis queues, and gives operators clear controls through Telegram.
+FastAPI service for receiving signed Meta/Instagram webhooks and scheduling tenant-scoped replies through recoverable Redis queues.
 
-The goal is simple: keep replies reliable under load, while still giving the team operational control.
+## Security and reliability guarantees
 
-## Project identity
+- `X-Hub-Signature-256` is verified over the bounded raw body before heartbeat, JSON parsing, or durable queue acceptance.
+- Current and previous Meta secrets are accepted during a bounded rotation window.
+- A valid delivery returns `200` only after atomic Redis inbox + deduplication acceptance. Redis failure returns retryable `503`.
+- Webhook and outbound workers use processing leases, capped exponential backoff, crash recovery, and terminal dead letters.
+- `/ops/*` requires an operator bearer token. Tenant Telegram admins are kept within their account; platform-global actions require an ID in `ADMIN_IDS`.
+- Logs use JSON, opaque user identifiers, request correlation IDs, and credential redaction. Webhook/message bodies are not logged.
+- `/health/live` tests the process only; `/health/ready` checks PostgreSQL and Redis without returning connection details.
 
-- Repository name: ig-reply-desk
-- One-line description: Instagram webhook and auto-reply backend with Redis queues, worker controls, and Telegram operations.
-- GitHub About text: FastAPI backend for Instagram webhooks, queued replies, and operator workflows via Telegram.
-- Suggested topics: fastapi, instagram, webhook, automation, redis, postgres, telegram-bot, worker-queue, backend
+See [the threat model](docs/THREAT_MODEL.md), [integration-test report](docs/INTEGRATION_TEST_REPORT.md), and [operations runbook](RUNBOOK.md).
 
-## What this service does
+## Request lifecycle
 
-- Receives Instagram events from Meta webhooks
-- Queues reply jobs in Redis instead of sending inline
-- Processes jobs through workers for better stability and throughput
-- Exposes operator actions and safety controls in Telegram
+1. A pre-authentication ingress limiter bounds forged-request work, and the ASGI body limiter rejects bodies over `MAX_WEBHOOK_BODY_BYTES` while streaming.
+2. The route verifies the Meta HMAC, then applies a separate valid-delivery rate limit.
+3. A SHA-256 delivery identity and payload are atomically inserted into the capacity-bounded Redis inbox if unseen.
+4. The inbox worker claims the delivery with a lease and processes tenant events.
+5. Event-level claims are marked complete only after processing; failures release the claim and schedule the delivery for retry.
+6. Outbound jobs are leased until Meta delivery succeeds. Terminal failures remain in `dead_letter:{account_id}` for explicit operator handling.
 
-## Main folders
+Redis must use AOF persistence and `noeviction`; the production Compose reference configures both. This design is at-least-once. A crash after Meta accepts an outbound send but before local acknowledgement can still produce a duplicate; consumers and operators should reconcile with Meta delivery identifiers where available.
 
-- `app/api/`: webhook endpoints
-- `app/services/`: reply engine, worker orchestration, account settings
-- `app/bot/`: Telegram commands and interaction flows
-- `app/routers/ops.py`: health and operational endpoints
-- `docker-compose.yml`: local app + Postgres + Redis stack
+## Local development
 
-## Local setup
-
-1. Create `.env` from `.env.example`.
-2. Fill all required Meta and Telegram credentials.
-3. Start the stack:
+Requires Python 3.12, PostgreSQL, and authenticated Redis.
 
 ```bash
-docker compose up --build
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env
+pytest -q
+uvicorn app.main:app --reload
 ```
 
-Service URL:
+Use `ENV=development` locally. `ENV=production` rejects short or documented placeholder credentials. Schema auto-creation is disabled by default; use `DB_AUTO_CREATE_SCHEMA=true` only for an empty local development database, never as the production migration strategy.
 
-`http://localhost:8000`
+## Production container
 
-## Useful endpoints
+Generate independent random values for PostgreSQL, Redis, application encryption, Meta verification, and ops authentication. Use a URL-safe random Redis password because the reference injects it into `REDIS_URL`. Then:
 
-- `GET /health`: basic service health
-- `GET /ops/status`: worker and queue status
-- `GET /instagram/webhook`: Meta verification endpoint
-- `POST /instagram/webhook`: incoming Instagram webhook events
+```bash
+docker compose -f docker-compose.prod.yml config
+docker compose -f docker-compose.prod.yml build --pull
+docker compose -f docker-compose.prod.yml up -d
+```
 
-## Security hardening checklist
+The reference binds the app to loopback. Terminate TLS at a trusted reverse proxy, preserve the source address, apply a matching edge body/rate limit, and expose only the application port. Do not add untrusted workloads to the internal `data` network.
 
-- Verify webhook signatures on every incoming Meta event.
-- Keep tokens and secrets only in environment variables (never in source control).
-- Rotate Meta and Telegram tokens on a fixed schedule.
-- Use least-privilege access for DB, Redis, and bot credentials.
-- Add rate limiting on public webhook routes.
-- Log events without leaking PII or credential values.
-- Restrict `/ops/*` endpoints behind authentication and role checks.
+## Endpoints
 
-## Operational notes
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `GET /health/live` | probe | Process liveness only |
+| `GET /health/ready` | probe | Coarse PostgreSQL/Redis readiness |
+| `GET /instagram/webhook` | public, limited | Meta subscription challenge |
+| `POST /instagram/webhook` | signed, limited | Durable webhook acceptance |
+| `GET /ops/status` | operator bearer token | Queue/worker status |
+| `GET /terms`, `GET /privacy` | public, limited | Legal pages |
 
-- Local startup creates required database tables.
-- Redis and Postgres must be healthy before handling production traffic.
-- Environment files, logs, and local artifacts are intentionally excluded from Git.
-- Documentation has been refreshed to improve operational clarity and security guidance.
+Authenticate operations with `Authorization: Bearer $OPS_API_TOKEN`. `X-Ops-Token` remains supported for systems that cannot set bearer authorization.
+
+## Tests
+
+```bash
+python -m compileall -q app tests
+pytest -q
+```
+
+Webhook lifecycle tests use synthetic local payloads and mocked Meta/storage boundaries. They do not contact Meta or use production credentials.
+
+## Responsible use
+
+Operate only accounts you are authorized to manage and follow Meta platform policies. This project does not provide bulk messaging, authentication bypass, or policy circumvention.

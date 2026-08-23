@@ -10,5 +10,3 @@ run.out.log
 backup_*.json.gz
 
 meta_*.html
-
-tests
