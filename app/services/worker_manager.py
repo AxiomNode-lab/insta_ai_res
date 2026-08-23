@@ -46,8 +46,8 @@ def run_worker_process(account_id: int, stop_event: Event):
                 duration = (time.time() - start_time) * 1000
                 await record_metric("processing_time_ms", account_id, duration)
                 
-            except Exception as e:
-                local_logger.error(f"Worker loop error: {e}")
+            except Exception as exc:
+                local_logger.error("Worker loop failed error_type=%s", type(exc).__name__)
                 await asyncio.sleep(5.0) 
                 
     try:
@@ -94,8 +94,8 @@ class WorkerManager:
                         
                 await asyncio.sleep(5.0)
                 
-            except Exception as e:
-                logger.error(f"Manager loop error: {e}")
+            except Exception as exc:
+                logger.error("Manager loop failed error_type=%s", type(exc).__name__)
                 await asyncio.sleep(5.0)
 
     def spawn_worker(self, account_id: int):

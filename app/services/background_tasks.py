@@ -29,7 +29,12 @@ def _truncate_log_text(text: str, limit: int = 300) -> str:
 
 
 def _format_http_error(response: httpx.Response) -> str:
-    return f"status={response.status_code}, body={_truncate_log_text(response.text)}"
+    error_code = "unknown"
+    try:
+        error_code = str(response.json().get("error", {}).get("code", "unknown"))
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return f"status={response.status_code}, meta_error_code={error_code}"
 
 
 def _get_account_api_token(account: Account) -> str | None:
@@ -139,8 +144,8 @@ async def calculate_daily_reputation_score():
                         
                 session.add(account)
                 
-            except Exception as e:
-                logger.error(f"Reputation calc error for {account.id}: {e}")
+            except Exception as exc:
+                logger.error("Reputation calculation failed account_id=%s error_type=%s", account.id, type(exc).__name__)
         
         # --- Part 2: Platform Reputation Protection (Global Trend) ---
         try:
@@ -174,8 +179,8 @@ async def calculate_daily_reputation_score():
                         redis = await get_redis_client()
                         await redis.setex("global_trust_preservation_mode", 86400, "1") # 24 hours
                         
-        except Exception as e:
-            logger.error(f"Platform Reputation Trend Error: {e}")
+        except Exception as exc:
+            logger.error("Platform reputation trend failed error_type=%s", type(exc).__name__)
 
         await session.commit()
 
@@ -296,8 +301,8 @@ async def refresh_instagram_token():
                         await notify_account_owner(account.id, f"✅ Instagram Token Refreshed. Valid for {expires_in // 86400} days.")
                     else:
                         await notify_account_owner(account.id, "⚠️ Failed to refresh Instagram Token! Please re-login.")
-            except Exception as e:
-                logger.error(f"Error refreshing token for account {account.id}: {e}")
+            except Exception as exc:
+                logger.error("Token refresh failed account_id=%s error_type=%s", account.id, type(exc).__name__)
 
 async def perform_token_refresh(current_token: str):
     url = "https://graph.instagram.com/refresh_access_token"
@@ -353,8 +358,8 @@ async def backup_system():
             # Cleanup
             os.remove(filename)
             
-    except Exception as e:
-        logger.error(f"Backup Failed: {e}")
+    except Exception as exc:
+        logger.error("Backup failed error_type=%s", type(exc).__name__)
         await notify_admin(f"❌ Backup Failed: {e}")
 
 async def data_retention_cleanup():
@@ -414,8 +419,8 @@ async def data_retention_cleanup():
                     session.add(log_entry)
                     await session.commit()
                     
-            except Exception as e:
-                logger.error(f"Cleanup failed for account {account.id}: {e}")
+            except Exception as exc:
+                logger.error("Cleanup failed account_id=%s error_type=%s", account.id, type(exc).__name__)
 
 async def permission_revocation_monitor():
     """
@@ -600,8 +605,8 @@ async def generate_daily_report():
                     
                 await notify_account_owner(stat.account_id, msg)
                 
-            except Exception as e:
-                logger.error(f"Error generating report for acc {stat.account_id}: {e}")
+            except Exception as exc:
+                logger.error("Report generation failed account_id=%s error_type=%s", stat.account_id, type(exc).__name__)
 
 async def calculate_weekly_health_score():
     """
@@ -613,51 +618,12 @@ async def calculate_weekly_health_score():
 
 async def dlq_auto_retry():
     """
-    Retries messages in Dead Letter Queue (DLQ) after 15 mins.
-    Only retries once.
-    """
-    from app.core.redis_utils import get_redis_client, enqueue_message
-    
-    logger.info("Running DLQ Auto Retry...")
-    redis = await get_redis_client()
-    
-    cursor = 0
-    pattern = "dead_letter:*"
-    
-    while True:
-        cursor, keys = await redis.scan(cursor, match=pattern, count=100)
-        for key in keys:
-            try:
-                account_id = int(key.split(":")[1])
-            except IndexError:
-                continue
+    Terminal dead letters require an explicit operator replay.
 
-            # Peek first item
-            item = await redis.lindex(key, 0)
-            if not item:
-                continue
-                
-            try:
-                data = json.loads(item)
-                failed_at = data.get("failed_at", 0)
-                
-                if time.time() - failed_at > 900: # 15 mins
-                    # Pop
-                    await redis.lpop(key)
-                    
-                    if data.get("dlq_retried"):
-                        continue
-                        
-                    recipient_id = data.get("recipient_id")
-                    text = data.get("text")
-                    
-                    if recipient_id and text:
-                        await enqueue_message(recipient_id, text, account_id)
-            except Exception as e:
-                logger.error(f"DLQ Retry Error: {e}")
-                
-        if cursor == 0:
-            break
+    Automatic retries are handled by the leased queue's bounded retry set. Keeping
+    terminal failures out of the scheduler prevents an infinite retry loop.
+    """
+    return 0
 
 async def monitor_human_neglect():
     """
@@ -681,12 +647,12 @@ async def monitor_human_neglect():
         for user in paused_users:
             try:
                 # Check last user message time
-                last_inter = await redis.get(f"last_interaction:{user.ig_id}")
+                last_inter = await redis.get(f"last_interaction:{user.account_id}:{user.ig_id}")
                 if not last_inter:
                     continue
                     
                 # Check last admin reply time
-                last_admin = await redis.get(f"last_admin_reply:{user.ig_id}")
+                last_admin = await redis.get(f"last_admin_reply:{user.account_id}:{user.ig_id}")
                 
                 # If user spoke AFTER admin (or admin never spoke)
                 if not last_admin or int(last_inter) > int(last_admin):
@@ -723,8 +689,8 @@ async def monitor_human_neglect():
                             await notify_account_owner(user.account_id, f"⏳ <b>تذكير</b>\nالعميل {user.full_name or user.ig_id} ينتظر الرد منذ 10 دقائق.")
                             await redis.setex(alert_key, 1800, "1") # Don't alert again for 30m
 
-            except Exception as e:
-                logger.error(f"Neglect monitor error: {e}")
+            except Exception as exc:
+                logger.error("Neglect monitor failed error_type=%s", type(exc).__name__)
 
 async def monitor_app_reputation():
     """
@@ -816,8 +782,8 @@ async def analyze_account_conversation_health():
                 total_platform_convs += total_convs
                 total_platform_dry += dry_count
                 
-            except Exception as e:
-                logger.error(f"Error analyzing account {account.id}: {e}")
+            except Exception as exc:
+                logger.error("Account analysis failed account_id=%s error_type=%s", account.id, type(exc).__name__)
         
         await session.commit()
         
@@ -887,10 +853,9 @@ async def scheduler():
         if now.minute % 10 == 0:
             await analyze_account_conversation_health()
         
-        # Every 15 minutes: Health Check & DLQ Retry & Neglect Monitor
+        # Every 15 minutes: Health Check & Neglect Monitor
         if now.minute % 15 == 0:
              await check_account_health()
-             await dlq_auto_retry()
              await monitor_human_neglect()
         
         # Run at 21:00 UTC: Daily Report & Reputation Calc

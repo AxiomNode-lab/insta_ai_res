@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Response, status
 from contextlib import asynccontextmanager
 import asyncio
 import logging
@@ -7,7 +7,11 @@ from sqlalchemy import text
 from aiogram import Bot
 
 from app.core.config import settings
+from app.core.auth import require_ops_access
 from app.core.database import engine, AsyncSessionLocal
+from app.core.http import MaxBodySizeMiddleware
+from app.core.observability import configure_logging, request_context_middleware
+from app.core.rate_limit import public_rate_limit
 from app.core.redis_utils import get_redis_client, init_redis_pool, close_redis_pool, ACTIVE_ACCOUNTS_KEY
 from app.models.base import Base
 # Import all models to ensure they are registered with Base.metadata
@@ -20,11 +24,10 @@ from app.bot.main import start_telegram_bot, stop_telegram_bot
 # from app.services.instagram_service import process_outgoing_queue # Deprecated in Phase 4
 from app.services.worker_pool_manager import worker_pool # New Worker Pool Manager
 from app.services.background_tasks import scheduler
+from app.services.webhook_queue import webhook_worker
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Setup privacy-safe structured logging.
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # --- Heartbeat Monitor ---
@@ -38,75 +41,89 @@ async def notify_super_admin(text: str):
         for admin_id in settings.ADMIN_IDS:
              await bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
         await bot.session.close()
-    except Exception as e:
-        logger.error(f"Failed to alert super admin: {e}")
+    except Exception as exc:
+        logger.error("Failed to alert super admin error_type=%s", type(exc).__name__)
 
 async def heartbeat_monitor_redis():
     logger.info("Heartbeat Monitor (Redis) Started.")
-    redis = await get_redis_client()
-    
     while True:
         await asyncio.sleep(60)
-        
-        if await redis.exists("global_safe_mode"):
-            continue
-            
-        last_ts = await redis.get("last_webhook_ts")
-        if last_ts:
-             if time.time() - float(last_ts) > 600:
-                 logger.warning("🚨 Heartbeat Alert (Redis): No Webhook received for 10 minutes!")
-                 await notify_super_admin("🚨 <b>CRITICAL:</b> No Webhook received for 10 minutes!")
-        else:
-             # Initial state or expired
-             pass
+        try:
+            redis = await get_redis_client()
+            if await redis.exists("global_safe_mode"):
+                continue
+            last_ts = await redis.get("last_webhook_ts")
+            if last_ts and time.time() - float(last_ts) > 600:
+                logger.warning("No authenticated webhook received for 10 minutes")
+                await notify_super_admin("🚨 <b>CRITICAL:</b> No Webhook received for 10 minutes!")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Heartbeat dependency unavailable error_type=%s", type(exc).__name__)
+
+
+async def _supervise(name: str, coroutine_factory, stop_event: asyncio.Event):
+    while not stop_event.is_set():
+        try:
+            await coroutine_factory()
+            if not stop_event.is_set():
+                logger.warning("Background service exited service=%s", name)
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Background service failed service=%s error_type=%s", name, type(exc).__name__)
+            await asyncio.sleep(2)
+
+
+async def _recover_dependencies(stop_event: asyncio.Event):
+    while not stop_event.is_set():
+        try:
+            if settings.DB_AUTO_CREATE_SCHEMA:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Account.id).where(Account.status == AccountStatus.ACTIVE)
+                )
+                active_ids = result.scalars().all()
+            redis = await get_redis_client()
+            if active_ids:
+                await redis.sadd(ACTIVE_ACCOUNTS_KEY, *[str(value) for value in active_ids])
+            logger.info("Dependency recovery completed active_accounts=%s", len(active_ids))
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Dependencies not ready error_type=%s", type(exc).__name__)
+            await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up...")
     
-    # Initialize Global Redis Pool
+    stop_event = asyncio.Event()
     await init_redis_pool()
-
-    # Create Tables (For dev/first run convenience)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    # Active Accounts Recovery
-    logger.info("Recovering Active Accounts to Redis...")
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Account.id).where(Account.status == AccountStatus.ACTIVE))
-        active_ids = result.scalars().all()
-        if active_ids:
-             redis = await get_redis_client()
-             pipe = redis.pipeline()
-             for aid in active_ids:
-                 pipe.sadd(ACTIVE_ACCOUNTS_KEY, str(aid))
-             await pipe.execute()
-    
-    # Start Telegram Bot in background
-    bot_task = asyncio.create_task(start_telegram_bot())
-    
-    # Start Worker Manager (Isolated Processes)
-    # worker_task = asyncio.create_task(process_outgoing_queue()) # Replaced
-    worker_pool_task = asyncio.create_task(worker_pool.start())
-    
-    # Start Scheduler (Backup & Token Refresh & Data Cleanup)
-    scheduler_task = asyncio.create_task(scheduler())
-    
-    # Start Heartbeat Monitor
-    heartbeat_task = asyncio.create_task(heartbeat_monitor_redis())
+    tasks = [
+        asyncio.create_task(_recover_dependencies(stop_event), name="dependency-recovery"),
+        asyncio.create_task(_supervise("telegram", start_telegram_bot, stop_event), name="telegram"),
+        asyncio.create_task(_supervise("worker-pool", worker_pool.start, stop_event), name="worker-pool"),
+        asyncio.create_task(_supervise("scheduler", scheduler, stop_event), name="scheduler"),
+        asyncio.create_task(_supervise("heartbeat", heartbeat_monitor_redis, stop_event), name="heartbeat"),
+        asyncio.create_task(webhook_worker(stop_event), name="webhook-inbox"),
+    ]
     
     yield
     
     # Shutdown
     logger.info("Shutting down...")
-    bot_task.cancel()
-    # worker_task.cancel()
+    stop_event.set()
     worker_pool.stop()
-    worker_pool_task.cancel()
-    scheduler_task.cancel()
-    heartbeat_task.cancel()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     await stop_telegram_bot()
     await close_redis_pool() # Close Pool
     await engine.dispose()
@@ -116,63 +133,59 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     lifespan=lifespan
 )
+app.add_middleware(MaxBodySizeMiddleware, max_body_bytes=settings.MAX_WEBHOOK_BODY_BYTES)
+app.middleware("http")(request_context_middleware)
 
 app.include_router(webhook.router, prefix="/instagram", tags=["webhook"])
-app.include_router(ops.router, prefix="/ops", tags=["operations"])
-app.include_router(legal.router, tags=["legal"])
+app.include_router(
+    ops.router,
+    prefix="/ops",
+    tags=["operations"],
+    dependencies=[Depends(require_ops_access)],
+)
+app.include_router(legal.router, tags=["legal"], dependencies=[Depends(public_rate_limit)])
 
-@app.get("/")
+@app.get("/", dependencies=[Depends(public_rate_limit)])
 async def root():
     return {"message": "Instagram Auto Reply System is Running"}
 
-@app.get("/health")
-async def health_check():
-    """
-    Production Health Check Endpoint.
-    Checks: DB, Redis, Meta Config, Global Safe Mode.
-    """
-    health_status = {
-        "db": "unknown",
-        "redis": "unknown",
-        "meta_config": "unknown",
-        "system_status": "running",
-        "status": "unhealthy"
-    }
-    
-    # 1. Check DB
-    try:
+@app.get("/health/live", include_in_schema=False)
+async def liveness():
+    return {"status": "alive"}
+
+
+async def _readiness_payload() -> tuple[dict, int]:
+    components = {"postgres": "unhealthy", "redis": "unhealthy", "configuration": "healthy"}
+
+    async def check_postgres():
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
-        health_status["db"] = "healthy"
-    except Exception as e:
-        health_status["db"] = f"unhealthy: {str(e)}"
 
-    # 2. Check Redis
-    try:
+    async def check_redis():
         redis = await get_redis_client()
         await redis.ping()
-        health_status["redis"] = "healthy"
-        
-        # Check Global Safe Mode
-        if await redis.exists("global_safe_mode"):
-            health_status["system_status"] = "SAFE_MODE (PAUSED)"
-            
-    except Exception as e:
-        health_status["redis"] = f"unhealthy: {str(e)}"
-        
-    # 3. Check Meta Config (Global)
-    if settings.INSTAGRAM_ACCESS_TOKEN and settings.META_APP_SECRET:
-         health_status["meta_config"] = "healthy"
-    else:
-         health_status["meta_config"] = "missing_config"
-         
-    # Final Status
-    if (health_status["db"] == "healthy" and 
-        health_status["redis"] == "healthy" and 
-        health_status["meta_config"] == "healthy"):
-        health_status["status"] = "healthy"
-        return health_status
-    else:
-        from fastapi import Response
-        import json
-        return Response(content=json.dumps(health_status), media_type="application/json", status_code=503)
+
+    try:
+        await asyncio.wait_for(check_postgres(), timeout=2)
+        components["postgres"] = "healthy"
+    except Exception as exc:
+        logger.warning("Readiness database check failed error_type=%s", type(exc).__name__)
+
+    try:
+        await asyncio.wait_for(check_redis(), timeout=2)
+        components["redis"] = "healthy"
+    except Exception as exc:
+        logger.warning("Readiness Redis check failed error_type=%s", type(exc).__name__)
+
+    ready = all(value == "healthy" for value in components.values())
+    return {"status": "ready" if ready else "not_ready", "components": components}, (
+        status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+    )
+
+
+@app.get("/health/ready", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
+async def readiness(response: Response):
+    payload, status_code = await _readiness_payload()
+    response.status_code = status_code
+    return payload

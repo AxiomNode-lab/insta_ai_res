@@ -9,13 +9,13 @@ import base64
 from cryptography.fernet import Fernet
 from app.core.config import settings
 
-def get_account_fernet(account_id: int) -> Fernet:
+def get_account_fernet(account_id: int, secret_key: str | None = None) -> Fernet:
     """
     Derives a unique encryption key for each account using HMAC-SHA256.
     Key = Base64(HMAC(SECRET_KEY, account_id))
     """
     key_material = hmac.new(
-        key=settings.SECRET_KEY.encode('utf-8'),
+        key=(secret_key or settings.SECRET_KEY).encode('utf-8'),
         msg=str(account_id).encode('utf-8'),
         digestmod=hashlib.sha256
     ).digest()
@@ -35,10 +35,19 @@ def decrypt_token(account_id: int, encrypted_token: str) -> str:
     """
     Decrypts access token. Raises InvalidToken if failed.
     """
-    f = get_account_fernet(account_id)
-    return f.decrypt(encrypted_token.encode('utf-8')).decode('utf-8')
+    last_error = None
+    for secret_key in settings.encryption_keys:
+        try:
+            return get_account_fernet(account_id, secret_key).decrypt(
+                encrypted_token.encode("utf-8")
+            ).decode("utf-8")
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    raise ValueError("No encryption keys configured")
 
-def verify_meta_signature(payload: bytes, signature_header: str) -> bool:
+def verify_meta_signature(payload: bytes, signature_header: str | None) -> bool:
     """
     Verifies the X-Hub-Signature-256 header sent by Meta Webhooks.
     """
@@ -46,13 +55,21 @@ def verify_meta_signature(payload: bytes, signature_header: str) -> bool:
         return False
     
     # Meta sends signature as "sha256=<signature>"
-    expected_signature = "sha256=" + hmac.new(
-        key=settings.META_APP_SECRET.encode('utf-8'),
-        msg=payload,
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(expected_signature, signature_header)
+    if not signature_header.startswith("sha256="):
+        return False
+
+    return any(
+        hmac.compare_digest(
+            "sha256="
+            + hmac.new(
+                key=secret.encode("utf-8"),
+                msg=payload,
+                digestmod=hashlib.sha256,
+            ).hexdigest(),
+            signature_header,
+        )
+        for secret in settings.meta_app_secrets
+    )
 
 def generate_appsecret_proof(access_token: str) -> str:
     """

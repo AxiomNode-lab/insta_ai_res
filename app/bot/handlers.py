@@ -35,6 +35,7 @@ from datetime import date
 import sys
 import logging
 import json
+import html
 import time
 
 router = Router()
@@ -92,13 +93,16 @@ def _build_comment_rules_summary(rules: list[dict[str, str]]) -> str:
         return "لا توجد قواعد حالياً."
     rows = []
     for idx, rule in enumerate(rules[:20], start=1):
-        rows.append(f"{idx}. {rule['keyword']} -> {_truncate_text(rule['response'], 50)}")
+        rows.append(
+            f"{idx}. {html.escape(rule['keyword'])} -> "
+            f"{html.escape(_truncate_text(rule['response'], 50))}"
+        )
     return "\n".join(rows)
 
 def _build_owner_texts_summary(owner_texts: dict[str, str]) -> str:
     rows = []
     for key, label in OWNER_TEXT_LABELS.items():
-        rows.append(f"• {label}: {_truncate_text(owner_texts[key], 70)}")
+        rows.append(f"• {label}: {html.escape(_truncate_text(owner_texts[key], 70))}")
     return "\n".join(rows)
 
 async def check_permission(message: Message, required_roles: list[AdminRole]) -> bool:
@@ -120,6 +124,24 @@ async def get_admin_account_id(session, telegram_id) -> int | None:
         stmt = select(Account.id).limit(1)
         return await session.scalar(stmt)
     return None
+
+
+def is_platform_admin(telegram_id: int) -> bool:
+    return telegram_id in settings.ADMIN_IDS
+
+
+async def can_access_account(session, telegram_id: int, account_id: int) -> bool:
+    if is_platform_admin(telegram_id):
+        return True
+    stmt = select(AdminUser.account_id).where(AdminUser.telegram_id == telegram_id)
+    return await session.scalar(stmt) == account_id
+
+
+async def require_platform_admin(message: Message) -> bool:
+    if is_platform_admin(message.from_user.id):
+        return True
+    await message.answer("⛔ هذا الإجراء مخصص لمسؤول المنصة.")
+    return False
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -148,7 +170,7 @@ async def cmd_start(message: Message):
 
 @router.message(Command("health_report"))
 async def health_report(message: Message):
-    if not await check_permission(message, [AdminRole.OWNER]):
+    if not await require_platform_admin(message):
         return
         
     redis = await get_redis_client()
@@ -185,6 +207,11 @@ async def account_status(message: Message):
     except:
         await message.answer("Usage: /account_status {id}")
         return
+
+    async with AsyncSessionLocal() as session:
+        if not await can_access_account(session, message.from_user.id, acc_id):
+            await message.answer("⛔ لا يمكنك الوصول إلى هذا الحساب.")
+            return
         
     metrics = await get_metrics(acc_id)
     
@@ -210,6 +237,10 @@ async def quarantine_cmd(message: Message):
         return
     try:
         acc_id = int(message.text.split()[1])
+        async with AsyncSessionLocal() as session:
+            if not await can_access_account(session, message.from_user.id, acc_id):
+                await message.answer("⛔ لا يمكنك إدارة هذا الحساب.")
+                return
         await set_account_quarantine(acc_id, True)
         await message.answer(f"🚫 Account {acc_id} Quarantined.")
     except:
@@ -221,6 +252,10 @@ async def unquarantine_cmd(message: Message):
         return
     try:
         acc_id = int(message.text.split()[1])
+        async with AsyncSessionLocal() as session:
+            if not await can_access_account(session, message.from_user.id, acc_id):
+                await message.answer("⛔ لا يمكنك إدارة هذا الحساب.")
+                return
         await set_account_quarantine(acc_id, False)
         await message.answer(f"✅ Account {acc_id} Released.")
     except:
@@ -232,6 +267,10 @@ async def show_deadletters(message: Message):
         return
     try:
         acc_id = int(message.text.split()[1])
+        async with AsyncSessionLocal() as session:
+            if not await can_access_account(session, message.from_user.id, acc_id):
+                await message.answer("⛔ لا يمكنك الوصول إلى هذا الحساب.")
+                return
         redis = await get_redis_client()
         key = f"dead_letter:{acc_id}"
         items = await redis.lrange(key, -5, -1) # Last 5
@@ -243,7 +282,7 @@ async def show_deadletters(message: Message):
         text = f"💀 <b>Dead Letters (Acc {acc_id})</b>\n\n"
         for item in items:
             data = json.loads(item)
-            text += f"To: {data.get('recipient_id')}\nErr: {data.get('error')}\n\n"
+            text += f"Job: {html.escape(str(data.get('job_id', 'unknown')))[:16]}\nErr: {html.escape(str(data.get('last_error_type') or data.get('error_type') or 'unknown'))}\n\n"
             
         await message.answer(text, parse_mode="HTML")
     except:
@@ -304,7 +343,7 @@ async def safety_logs(message: Message):
             
         text = "🚨 <b>Recent Safety Events</b>\n\n"
         for e in events:
-            text += f"⚠️ {e.event_type}\n{e.details}\n🕒 {e.created_at.strftime('%H:%M')}\n\n"
+            text += f"⚠️ {html.escape(e.event_type)}\n{html.escape(e.details or '')}\n🕒 {e.created_at.strftime('%H:%M')}\n\n"
             
         await message.answer(text, parse_mode="HTML")
 
@@ -320,20 +359,21 @@ async def force_human_cmd(message: Message):
              return
              
         ig_id = parts[1]
-        await set_human_takeover(ig_id, True)
-        
         async with AsyncSessionLocal() as session:
             acc_id = await get_admin_account_id(session, message.from_user.id)
             stmt = select(User).where(User.ig_id == ig_id, User.account_id == acc_id)
             res = await session.execute(stmt)
             user = res.scalar_one_or_none()
-            if user:
-                user.is_paused = True
-                await session.commit()
+            if not user:
+                await message.answer("⛔ المستخدم غير موجود في حسابك.")
+                return
+            await set_human_takeover(acc_id, ig_id, True)
+            user.is_paused = True
+            await session.commit()
                 
         await message.answer(f"👤 User {ig_id} forced to Human Mode.")
     except Exception as e:
-        logger.error(f"Force human error: {e}")
+        logger.error("Force human failed error_type=%s", type(e).__name__)
         await message.answer("Error executing command.")
 
 @router.message(Command("why"))
@@ -368,7 +408,7 @@ async def why_cmd(message: Message):
                 await message.answer("ℹ️ No recent decision logs found for this user.")
                 return
                 
-            text = f"🧐 <b>Decision Log for {ig_id}</b>\n\n"
+            text = f"🧐 <b>Decision Log for {html.escape(ig_id)}</b>\n\n"
             for e in events:
                 explanation = "Unknown"
                 if "AUTO_REPLY" in e.event_type: explanation = "✅ Replied (Matched Rule)"
@@ -378,12 +418,12 @@ async def why_cmd(message: Message):
                 elif "INTENT" in e.event_type: explanation = "❓ Intent Not Understood"
                 elif "IGNORE" in e.event_type: explanation = "🎲 Ignored (Random/Human Like)"
                 
-                text += f"⏰ {e.created_at.strftime('%H:%M')}\nType: <code>{e.event_type}</code>\nWhy: {explanation}\n\n"
+                text += f"⏰ {e.created_at.strftime('%H:%M')}\nType: <code>{html.escape(e.event_type)}</code>\nWhy: {explanation}\n\n"
                 
             await message.answer(text, parse_mode="HTML")
             
     except Exception as e:
-        logger.error(f"Why cmd error: {e}")
+        logger.error("Why command failed error_type=%s", type(e).__name__)
         await message.answer("Error executing command.")
 
 @router.message(Command("timeline"))
@@ -395,9 +435,14 @@ async def timeline_cmd(message: Message):
         parts = message.text.split()
         target_acc_id = None
         
-        # If admin provides account ID (for Super Admin debugging)
+        # Cross-account timelines are reserved for platform admins.
         if len(parts) > 1 and parts[1].isdigit():
-            target_acc_id = int(parts[1])
+            requested = int(parts[1])
+            async with AsyncSessionLocal() as session:
+                if not await can_access_account(session, message.from_user.id, requested):
+                    await message.answer("⛔ لا يمكنك الوصول إلى هذا الحساب.")
+                    return
+            target_acc_id = requested
         else:
             # Use their own account
             async with AsyncSessionLocal() as session:
@@ -435,12 +480,12 @@ async def timeline_cmd(message: Message):
                 elif "SPIKE" in e.event_type: icon = "📈"
                 elif "REPUTATION" in e.event_type: icon = "🚨"
                 
-                text += f"{icon} <code>{time_str}</code> <b>{e.event_type}</b>\n└ {e.details}\n"
+                text += f"{icon} <code>{time_str}</code> <b>{html.escape(e.event_type)}</b>\n└ {html.escape(e.details or '')}\n"
                 
             await message.answer(text, parse_mode="HTML")
             
     except Exception as e:
-        logger.error(f"Timeline error: {e}")
+        logger.error("Timeline failed error_type=%s", type(e).__name__)
         await message.answer("Error executing timeline.")
 
 @router.message(Command("setup_check"))
@@ -517,7 +562,7 @@ async def suggested_intents_cmd(message: Message):
                 text_hash = key.split(":")[-1]
                 count = await redis.get(f"unknown_intent:{acc_id}:{text_hash}")
                 if count and int(count) >= 5:
-                    found_texts.append(f"🔸 ({count} times): {text}")
+                    found_texts.append(f"🔸 ({count} times): {html.escape(text or '')}")
             if cursor == 0:
                 break
                 
@@ -537,10 +582,17 @@ async def human_status_cmd(message: Message):
          return
          
      ig_id = parts[1]
+     async with AsyncSessionLocal() as session:
+         acc_id = await get_admin_account_id(session, message.from_user.id)
+         user = await session.scalar(
+             select(User).where(User.ig_id == ig_id, User.account_id == acc_id)
+         )
+         if not user:
+             await message.answer("⛔ المستخدم غير موجود في حسابك.")
+             return
      redis = await get_redis_client()
-     
-     is_active = await redis.exists(f"human_mode:{ig_id}")
-     last_reply = await redis.get(f"last_admin_reply:{ig_id}")
+     is_active = await redis.exists(f"human_mode:{acc_id}:{ig_id}")
+     last_reply = await redis.get(f"last_admin_reply:{acc_id}:{ig_id}")
      
      status = "🟢 Active (Human Mode)" if is_active else "⚪ Inactive (Auto Mode)"
      last_reply_str = "Never"
@@ -561,16 +613,17 @@ async def restore_bot_cmd(message: Message):
          return
          
      ig_id = parts[1]
-     await set_human_takeover(ig_id, False)
-     
      async with AsyncSessionLocal() as session:
          acc_id = await get_admin_account_id(session, message.from_user.id)
          stmt = select(User).where(User.ig_id == ig_id, User.account_id == acc_id)
          res = await session.execute(stmt)
          user = res.scalar_one_or_none()
-         if user:
-             user.is_paused = False
-             await session.commit()
+         if not user:
+             await message.answer("⛔ المستخدم غير موجود في حسابك.")
+             return
+         await set_human_takeover(acc_id, ig_id, False)
+         user.is_paused = False
+         await session.commit()
              
      await message.answer(f"🤖 Bot restored for {ig_id}.")
 
@@ -637,7 +690,11 @@ async def show_activity(message: Message):
             elif "LIMIT" in event.event_type: icon = "⚠️"
             elif "NEW_USER" in event.event_type: icon = "➕"
             
-            text += f"{icon} <code>{time_str}</code> | <b>{event.event_type}</b>\n{event.details or ''}\n\n"
+            text += (
+                f"{icon} <code>{time_str}</code> | "
+                f"<b>{html.escape(event.event_type)}</b>\n"
+                f"{html.escape(event.details or '')}\n\n"
+            )
             
         await message.answer(text, parse_mode="HTML")
 
@@ -1036,8 +1093,7 @@ async def list_replies(callback: CallbackQuery):
 @router.callback_query(F.data == "toggle_system")
 async def toggle_system(callback: CallbackQuery):
     async with AsyncSessionLocal() as session:
-        role = await get_admin_role(session, callback.from_user.id)
-        if role != AdminRole.OWNER:
+        if not is_platform_admin(callback.from_user.id):
              await callback.answer("⛔ فقط المالك يمكنه تغيير حالة النظام.")
              return
 
@@ -1081,7 +1137,7 @@ async def process_pause_user(message: Message, state: FSMContext):
         else:
             user.is_paused = not user.is_paused
             await session.commit()
-            await set_human_takeover(ig_id, active=user.is_paused)
+            await set_human_takeover(acc_id, ig_id, active=user.is_paused)
             status = "🛑 متوقف (Human Mode)" if user.is_paused else "✅ مفعل (Auto Reply)"
             await message.answer(f"تم تحديث حالة المستخدم {user.full_name or ig_id}:\n{status}", reply_markup=main_menu_keyboard())
             await log_admin_action(session, message.from_user.id, "human_mode", f"User: {ig_id}, Paused: {user.is_paused}")
@@ -1091,7 +1147,7 @@ async def process_pause_user(message: Message, state: FSMContext):
 # --- Kill Switch ---
 @router.message(Command("pause_all"))
 async def kill_switch(message: Message):
-    if not await check_permission(message, [AdminRole.OWNER]):
+    if not await require_platform_admin(message):
         return
         
     await set_global_kill_switch(True)
@@ -1102,7 +1158,7 @@ async def kill_switch(message: Message):
 
 @router.message(Command("resume_all"))
 async def resume_switch(message: Message):
-    if not await check_permission(message, [AdminRole.OWNER]):
+    if not await require_platform_admin(message):
         return
         
     await set_global_kill_switch(False)
@@ -1124,6 +1180,10 @@ async def lock_account_cmd(message: Message):
         return
     try:
         acc_id = int(message.text.split()[1])
+        async with AsyncSessionLocal() as session:
+            if not await can_access_account(session, message.from_user.id, acc_id):
+                await message.answer("⛔ لا يمكنك إدارة هذا الحساب.")
+                return
         await set_account_lockdown(acc_id, True)
         await message.answer(f"🔒 Account {acc_id} LOCKED (Processing Stopped).")
     except:
@@ -1135,6 +1195,10 @@ async def unlock_account_cmd(message: Message):
         return
     try:
         acc_id = int(message.text.split()[1])
+        async with AsyncSessionLocal() as session:
+            if not await can_access_account(session, message.from_user.id, acc_id):
+                await message.answer("⛔ لا يمكنك إدارة هذا الحساب.")
+                return
         await set_account_lockdown(acc_id, False)
         await message.answer(f"🔓 Account {acc_id} UNLOCKED.")
     except:
@@ -1152,6 +1216,9 @@ async def live_chat_reply_start(callback: CallbackQuery, state: FSMContext):
     ig_id = parts[2]
     
     async with AsyncSessionLocal() as session:
+        if not await can_access_account(session, callback.from_user.id, account_id):
+             await callback.answer("⛔ لا يمكنك الوصول إلى هذا الحساب.")
+             return
         stmt = select(User).where(User.ig_id == ig_id, User.account_id == account_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
@@ -1175,16 +1242,19 @@ async def live_chat_send(message: Message, state: FSMContext):
     if not ig_id or not text or not account_id:
         return
 
-    await set_human_takeover(ig_id, active=True)
-    await record_admin_reply(ig_id) # Record time for auto-recovery
-    await enqueue_message(ig_id, text, account_id)
-    
     async with AsyncSessionLocal() as session:
+        if not await can_access_account(session, message.from_user.id, account_id):
+            await message.answer("⛔ لا يمكنك الوصول إلى هذا الحساب.")
+            await state.clear()
+            return
         stmt = select(User).where(User.ig_id == ig_id, User.account_id == account_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
         
         if user:
+            await set_human_takeover(account_id, ig_id, active=True)
+            await record_admin_reply(account_id, ig_id)
+            await enqueue_message(ig_id, text, account_id)
             user.is_paused = True 
             
             reply_msg = DBMessage(
