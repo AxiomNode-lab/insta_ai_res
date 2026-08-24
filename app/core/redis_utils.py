@@ -438,7 +438,15 @@ async def acquire_queue_lock(lock_key: str, expiration: int = 30) -> bool:
     success = await client.set(lock_key, "1", ex=expiration, nx=True)
     return bool(success)
 
-async def enqueue_message(recipient_id: str, text: str, account_id: int, delay: float = 0):
+async def enqueue_message(
+    recipient_id: str,
+    text: str,
+    account_id: int,
+    delay: float = 0,
+    recipient_type: str = "user",
+):
+    if recipient_type not in {"user", "comment"}:
+        raise ValueError("Unsupported Meta recipient type")
     client = await get_redis_client()
     
     # Backpressure check
@@ -449,6 +457,7 @@ async def enqueue_message(recipient_id: str, text: str, account_id: int, delay: 
     payload = json.dumps({
         "job_id": uuid.uuid4().hex,
         "recipient_id": recipient_id, 
+        "recipient_type": recipient_type,
         "text": text, 
         "account_id": account_id,
         "delay": delay,
@@ -460,6 +469,77 @@ async def enqueue_message(recipient_id: str, text: str, account_id: int, delay: 
     pipe.rpush(queue_key, payload)
     pipe.sadd(ACTIVE_ACCOUNTS_KEY, str(account_id))
     await pipe.execute()
+
+
+async def enqueue_private_reply(comment_id: str, text: str, account_id: int, delay: float = 0):
+    """Queue Meta's one-time private reply addressed to the comment, not the user."""
+    await enqueue_message(
+        recipient_id=comment_id,
+        text=text,
+        account_id=account_id,
+        delay=delay,
+        recipient_type="comment",
+    )
+
+
+_ENQUEUE_AFTER_HOURS_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+local depth = redis.call('LLEN', KEYS[2])
+  + redis.call('ZCARD', KEYS[3])
+  + redis.call('ZCARD', KEYS[4])
+if depth >= tonumber(ARGV[2]) then
+  return -1
+end
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+redis.call('RPUSH', KEYS[2], ARGV[3])
+redis.call('SADD', KEYS[5], ARGV[4])
+return 1
+"""
+
+
+async def enqueue_after_hours_notice(
+    recipient_id: str,
+    text: str,
+    account_id: int,
+    delay: float = 0,
+    expiration: int = 21600,
+) -> bool:
+    """Atomically claim the cooldown and durably enqueue the customer notice."""
+    payload = json.dumps(
+        {
+            "job_id": uuid.uuid4().hex,
+            "recipient_id": recipient_id,
+            "recipient_type": "user",
+            "text": text,
+            "account_id": account_id,
+            "delay": delay,
+            "attempt": 0,
+            "queued_at": time.time(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    client = await get_redis_client()
+    result = int(
+        await client.eval(
+            _ENQUEUE_AFTER_HOURS_SCRIPT,
+            5,
+            f"after_hours_notice:{account_id}:{recipient_id}",
+            f"queue:{account_id}",
+            f"queue:processing:{account_id}",
+            f"queue:retry:{account_id}",
+            ACTIVE_ACCOUNTS_KEY,
+            expiration,
+            settings.OUTBOUND_QUEUE_MAX_DEPTH,
+            payload,
+            account_id,
+        )
+    )
+    if result == -1:
+        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
+    return result == 1
 
 
 _CLAIM_OUTBOUND_SCRIPT = """

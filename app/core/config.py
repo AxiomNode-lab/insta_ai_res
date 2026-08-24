@@ -2,6 +2,7 @@ from typing import List, Union
 from pydantic import AnyHttpUrl, PostgresDsn, RedisDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
+import re
 
 class Settings(BaseSettings):
     PROJECT_NAME: str
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
     META_APP_SECRET: str
     META_APP_SECRET_PREVIOUS: str | None = None
     META_VERIFY_TOKEN: str
+    META_GRAPH_API_VERSION: str = "v26.0"
     INSTAGRAM_ACCESS_TOKEN: str
     INSTAGRAM_PAGE_ID: str
 
@@ -78,6 +80,13 @@ class Settings(BaseSettings):
             except json.JSONDecodeError:
                 return []
         return v
+
+    @field_validator("META_GRAPH_API_VERSION")
+    @classmethod
+    def validate_meta_graph_api_version(cls, value: str) -> str:
+        if not re.fullmatch(r"v[1-9]\d*\.0", value):
+            raise ValueError("META_GRAPH_API_VERSION must look like v26.0")
+        return value
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

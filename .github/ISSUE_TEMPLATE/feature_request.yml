@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a user-initiated, policy-compliant improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the smallest useful behavior and its failure mode.
+    validations:
+      required: true
+  - type: textarea
+    id: policy
+    attributes:
+      label: Meta/privacy impact
+      description: Note permissions, messaging-window, data-retention, or privacy implications.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This does not require unsolicited messaging, policy bypass, or storing raw credentials/log payloads.
+          required: true

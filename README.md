@@ -1,48 +1,115 @@
-# IG Reply Desk
+<p align="center">
+  <img src="docs/assets/ig-reply-desk-hero.svg" alt="IG Reply Desk — secure, durable Instagram support automation" width="100%">
+</p>
 
-FastAPI service for receiving signed Meta/Instagram webhooks and scheduling tenant-scoped replies through recoverable Redis queues.
+<p align="center">
+  <a href="https://github.com/imedkablavi/insta_ai_res/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/imedkablavi/insta_ai_res/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white">
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white">
+  <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-f59e0b">
+</p>
 
-## Security and reliability guarantees
+<p align="center">
+  An inbound Instagram support desk with signed Meta webhooks, tenant-scoped automation,
+  recoverable Redis queues, business hours, and Telegram human handoff.
+</p>
 
-- `X-Hub-Signature-256` is verified over the bounded raw body before heartbeat, JSON parsing, or durable queue acceptance.
-- Current and previous Meta secrets are accepted during a bounded rotation window.
-- A valid delivery returns `200` only after atomic Redis inbox + deduplication acceptance. Redis failure returns retryable `503`.
-- Webhook and outbound workers use processing leases, capped exponential backoff, crash recovery, and terminal dead letters.
-- `/ops/*` requires an operator bearer token. Tenant Telegram admins are kept within their account; platform-global actions require an ID in `ADMIN_IDS`.
-- Logs use JSON, opaque user identifiers, request correlation IDs, and credential redaction. Webhook/message bodies are not logged.
-- `/health/live` tests the process only; `/health/ready` checks PostgreSQL and Redis without returning connection details.
+> [!IMPORTANT]
+> The security and reliability controls are implemented and locally tested, but a real Meta test-account matrix is still a production gate. See [what is proven](docs/META_NATIVE_TEST_REPORT.md) and [what remains](ROADMAP.md).
 
-See [the threat model](docs/THREAT_MODEL.md), [integration-test report](docs/INTEGRATION_TEST_REPORT.md), and [operations runbook](RUNBOOK.md).
+## Why IG Reply Desk?
 
-## Request lifecycle
+Most webhook demos stop after “receive JSON and send a reply.” IG Reply Desk focuses on what happens in production: forged requests, duplicate deliveries, dependency outages, queue recovery, tenant boundaries, messaging-window policy, operator handoff, and privacy-safe diagnostics.
 
-1. A pre-authentication ingress limiter bounds forged-request work, and the ASGI body limiter rejects bodies over `MAX_WEBHOOK_BODY_BYTES` while streaming.
-2. The route verifies the Meta HMAC, then applies a separate valid-delivery rate limit.
-3. A SHA-256 delivery identity and payload are atomically inserted into the capacity-bounded Redis inbox if unseen.
-4. The inbox worker claims the delivery with a lease and processes tenant events.
-5. Event-level claims are marked complete only after processing; failures release the claim and schedule the delivery for retry.
-6. Outbound jobs are leased until Meta delivery succeeds. Terminal failures remain in `dead_letter:{account_id}` for explicit operator handling.
+It is intentionally built for **user-initiated support**, not unsolicited broadcasts.
 
-Redis must use AOF persistence and `noeviction`; the production Compose reference configures both. This design is at-least-once. A crash after Meta accepts an outbound send but before local acknowledgement can still produce a duplicate; consumers and operators should reconcile with Meta delivery identifiers where available.
+## Highlights
 
-## Local development
+| Area | What is included |
+|---|---|
+| Meta-native messaging | DMs, Quick Replies, Ice Breakers/Persistent Menu postbacks, and one-time comment Private Replies |
+| Arabic automation | Normalized exact, keyword, and fallback rules with reply-safety heuristics |
+| Human handoff | Telegram alerts, live replies, human mode, role checks, and tenant scoping |
+| Business hours | Per-account IANA timezone, weekdays, overnight shifts, and an atomic six-hour notice cooldown |
+| Reliable delivery | Durable Redis inbox/outbox, leases, bounded retries, crash recovery, backpressure, and dead letters |
+| Security | Meta HMAC verification before processing, replay protection, `/ops/*` auth, rate limits, secret rotation, and redacted JSON logs |
+| Operations | Liveness/readiness probes, dependency-aware workers, production Docker reference, runbook, and queue telemetry |
+| Quality | Fast local suite plus a real-Redis atomicity test in CI and a production-image build gate |
 
-Requires Python 3.12, PostgreSQL, and authenticated Redis.
+### A note about “AI”
+
+The current reply engine is deterministic. It normalizes Arabic and evaluates configured rules and safety policies; it does **not** call an LLM or claim generative-AI behavior. Grounded AI is a roadmap item only after evaluation, privacy, prompt-injection, and human-fallback controls exist.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Meta["Meta webhooks"] --> API["FastAPI ingress"]
+    API --> Redis["Redis inbox/outbox"]
+    Redis --> Worker["Tenant worker"]
+    Worker --> Data["PostgreSQL"]
+    Worker --> Channels["Meta reply / Telegram handoff"]
+```
+
+Request processing is at-least-once:
+
+1. Bound the body and pre-authentication work.
+2. Verify `X-Hub-Signature-256` over the raw body.
+3. Atomically deduplicate and accept the delivery into Redis.
+4. Resolve the tenant and claim each event with a processing lease.
+5. Apply business-hours, user/account, reply, and messaging-window policies.
+6. Lease outbound work until Meta accepts it or retries end in a tenant dead-letter queue.
+
+## Quick start
+
+Requirements: Python 3.12, PostgreSQL, Redis, and Meta/Telegram test credentials.
 
 ```bash
+git clone https://github.com/imedkablavi/insta_ai_res.git
+cd insta_ai_res
+
 python -m venv .venv
 . .venv/bin/activate
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 cp .env.example .env
-pytest -q
+
+PYTHONPATH=. pytest -q
 uvicorn app.main:app --reload
 ```
 
-Use `ENV=development` locally. `ENV=production` rejects short or documented placeholder credentials. Schema auto-creation is disabled by default; use `DB_AUTO_CREATE_SCHEMA=true` only for an empty local development database, never as the production migration strategy.
+Use `ENV=development` locally. Production mode rejects short and documented placeholder credentials. `DB_AUTO_CREATE_SCHEMA=true` is only for an empty local development database; production schema changes must be migration-owned.
 
-## Production container
+## Meta configuration checklist
 
-Generate independent random values for PostgreSQL, Redis, application encryption, Meta verification, and ops authentication. Use a URL-safe random Redis password because the reference injects it into `REDIS_URL`. Then:
+- Configure the HTTPS callback at `/instagram/webhook`.
+- Set an independent `META_VERIFY_TOKEN` and current `META_APP_SECRET`.
+- Subscribe the test app/account to the message, messaging-postback, and comment events required by the enabled features.
+- Pin `META_GRAPH_API_VERSION` and test every upgrade before rollout. The default is `v26.0`; the previous hard-coded `v19.0` expired in May 2026.
+- Run the [manual Meta sandbox matrix](docs/META_NATIVE_TEST_REPORT.md) before enabling a production account.
+
+Comment automation uses Meta's one-time Private Reply addressed to `comment_id`; a public comment is never treated as permission to open an ordinary DM window.
+
+## Telegram operator experience
+
+Authorized owners/managers can:
+
+- manage exact, keyword, fallback, and comment-private-reply rules;
+- customize welcome, fallback, and after-hours text;
+- configure timezone-aware business hours;
+- receive live-chat notifications and take over conversations;
+- inspect coarse diagnostics without exposing webhook bodies or credentials.
+
+Business-hours input example:
+
+```text
+Europe/Istanbul 0,1,2,3,4 09:00 18:00
+```
+
+Days use `0=Monday` through `6=Sunday`. A close time earlier than open is an overnight shift.
+
+## Production deployment
+
+Generate independent random values for PostgreSQL, Redis, application encryption, Meta verification, and operations authentication. Use a URL-safe Redis password because the Compose reference injects it into `REDIS_URL`.
 
 ```bash
 docker compose -f docker-compose.prod.yml config
@@ -50,30 +117,63 @@ docker compose -f docker-compose.prod.yml build --pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-The reference binds the app to loopback. Terminate TLS at a trusted reverse proxy, preserve the source address, apply a matching edge body/rate limit, and expose only the application port. Do not add untrusted workloads to the internal `data` network.
+The reference binds the app to loopback. Terminate TLS at a trusted reverse proxy, preserve the intended source address, enforce matching edge body/rate limits, and expose only the application port. Do not place untrusted workloads on the internal data network.
+
+Redis must use AOF persistence and `noeviction`. At-least-once delivery still has one residual edge: a worker crash after Meta accepts a send but before local acknowledgement can duplicate an external effect.
 
 ## Endpoints
 
 | Endpoint | Access | Purpose |
 |---|---|---|
-| `GET /health/live` | probe | Process liveness only |
-| `GET /health/ready` | probe | Coarse PostgreSQL/Redis readiness |
-| `GET /instagram/webhook` | public, limited | Meta subscription challenge |
-| `POST /instagram/webhook` | signed, limited | Durable webhook acceptance |
-| `GET /ops/status` | operator bearer token | Queue/worker status |
-| `GET /terms`, `GET /privacy` | public, limited | Legal pages |
+| `GET /health/live` | Probe | Process liveness only |
+| `GET /health/ready` | Probe | Coarse PostgreSQL/Redis readiness |
+| `GET /instagram/webhook` | Public, limited | Meta subscription challenge |
+| `POST /instagram/webhook` | Meta-signed, limited | Durable webhook acceptance |
+| `GET /ops/status` | Operator bearer token | Queue, worker, and traffic status |
+| `GET /terms`, `GET /privacy` | Public, limited | Legal information |
 
-Authenticate operations with `Authorization: Bearer $OPS_API_TOKEN`. `X-Ops-Token` remains supported for systems that cannot set bearer authorization.
+Use `Authorization: Bearer $OPS_API_TOKEN` for operations. `X-Ops-Token` remains available for systems that cannot set bearer authentication.
 
-## Tests
+## Verification
 
 ```bash
 python -m compileall -q app tests
-pytest -q
+PYTHONPATH=. pytest -q
+python -m pip check
 ```
 
-Webhook lifecycle tests use synthetic local payloads and mocked Meta/storage boundaries. They do not contact Meta or use production credentials.
+The default suite uses synthetic payloads and mocked external boundaries. CI additionally runs the Redis Lua atomicity contract against an isolated Redis service and builds the production image.
 
-## Responsible use
+## Documentation
 
-Operate only accounts you are authorized to manage and follow Meta platform policies. This project does not provide bulk messaging, authentication bypass, or policy circumvention.
+- [Roadmap](ROADMAP.md)
+- [Operations runbook](RUNBOOK.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Security integration report](docs/INTEGRATION_TEST_REPORT.md)
+- [Meta-native test report](docs/META_NATIVE_TEST_REPORT.md)
+- [Product gap analysis](docs/PRODUCT_GAP_ANALYSIS.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+
+## Known production gates
+
+- Real Meta sandbox verification and app review/permissions.
+- Meta user-data deletion callback and auditable deletion lifecycle.
+- Instagram Login OAuth onboarding and reauthorization UX.
+- Real Alembic revisions with upgrade and rollback tests.
+- Staging exercises for Redis AOF recovery, PostgreSQL outage, and process-kill recovery.
+- A shared web inbox if the project expands beyond Telegram-based operations.
+
+## Contributing and responsible use
+
+Issues and PRs are welcome for reliable, privacy-conscious inbound support features. Read [CONTRIBUTING.md](CONTRIBUTING.md) first and report vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
+Operate only accounts you are authorized to manage and follow Meta platform policies. This project does not provide bulk messaging, authentication bypass, DRM/circumvention, or private-data scraping.
+
+## License
+
+No open-source license has been selected yet. Until the maintainer chooses one, source visibility does not grant reuse, modification, or redistribution rights.
+
+---
+
+<sub>IG Reply Desk is an independent project and is not affiliated with or endorsed by Meta.</sub>

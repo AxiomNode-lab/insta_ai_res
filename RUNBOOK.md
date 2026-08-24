@@ -1,5 +1,39 @@
 # Operations Runbook - IG Reply Desk
 
+## Meta-native feature configuration
+
+### Comment private replies
+
+Use Telegram's **رد خاص للتعليقات** menu to map a comment keyword to one private reply. The worker addresses the request to Meta's `comment_id`; it does not treat the public comment as permission to open an ordinary 24-hour DM window.
+
+Before enabling in production, subscribe the Meta app to comment events and run the manual sandbox sequence in `docs/META_NATIVE_TEST_REPORT.md`. A duplicate webhook for the same comment must not generate another reply. Do not replay a comment dead-letter blindly if operators already observed a successful Meta delivery.
+
+### Postbacks
+
+Subscribe the Meta app to the webhook fields required for messages and messaging postbacks. Quick Reply payloads and Ice Breaker/Persistent Menu postbacks are mapped into the same account-scoped exact/keyword rule engine. Keep configured payloads stable and non-sensitive; payload values may appear in stored conversation content and rule diagnostics.
+
+### Business hours
+
+From Telegram choose **ساعات العمل**. Configure an IANA timezone and a schedule such as:
+
+```text
+Europe/Istanbul 0,1,2,3,4 09:00 18:00
+```
+
+Days use `0=Monday` through `6=Sunday`. A close time earlier than the open time is treated as an overnight shift. Outside the schedule, the inbound message is stored, the team is notified, and the customer receives at most one notice every six hours. Disabling the setting restores continuous automation.
+
+During incident response, business hours are not a global kill switch. Use the existing account lockdown or global kill switch when outbound delivery must stop.
+
+### Meta Graph API upgrades
+
+The deployment pins `META_GRAPH_API_VERSION` (currently `v26.0`). At least quarterly, compare it with Meta's official version schedule. Before changing it:
+
+1. run all local tests;
+2. deploy the candidate version to a Meta test app/account;
+3. verify message send, comment private reply, postback, permission check, token refresh, and webhook lifecycle;
+4. roll out gradually and watch Meta error codes, retries, and dead letters;
+5. keep the previous deploy image available for rollback, but never roll back to a sunset API version.
+
 This runbook is written for real daily use.
 Follow it in order, escalate early, and avoid risky manual fixes during incidents.
 
