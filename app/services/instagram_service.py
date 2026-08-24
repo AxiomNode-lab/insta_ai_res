@@ -21,6 +21,8 @@ from app.core.redis_utils import (
     update_last_interaction,
     is_within_24h_window,
     enqueue_message,
+    enqueue_private_reply,
+    enqueue_after_hours_notice,
     get_next_message_from_queue,
     claim_outbound_message,
     acknowledge_outbound_message,
@@ -44,12 +46,22 @@ from app.core.redis_utils import (
     is_trust_recovery_mode,
     record_bot_like_start
 )
-from app.models.all_models import User, Message, MessageDirection, Account, ActivityEvent, Conversation
+from app.models.all_models import (
+    Account,
+    ActivityEvent,
+    AdminUser,
+    Conversation,
+    Message,
+    MessageDirection,
+    User,
+)
 from app.services.reply_engine import get_auto_reply, normalize_arabic
 from app.services.account_settings import (
     find_comment_dm_match,
+    get_business_hours,
     get_comment_dm_rules,
     get_owner_texts,
+    is_business_open,
 )
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,11 +73,47 @@ import time
 
 logger = logging.getLogger(__name__)
 
-GRAPH_API_URL = "https://graph.facebook.com/v19.0"
+GRAPH_API_URL = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
 
 
 class DeliveryPolicyBlocked(RuntimeError):
     pass
+
+
+def extract_event_text(event: dict) -> str | None:
+    """Return user-visible text or a configured Meta postback payload."""
+    message = event.get("message") or {}
+    text = message.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    quick_reply = message.get("quick_reply") or {}
+    payload = quick_reply.get("payload")
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+
+    postback = event.get("postback") or {}
+    for key in ("title", "payload"):
+        value = postback.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def build_instagram_message_payload(
+    recipient_id: str, text: str, recipient_type: str = "user"
+) -> dict:
+    if recipient_type == "user":
+        recipient = {"id": recipient_id}
+    elif recipient_type == "comment":
+        recipient = {"comment_id": recipient_id}
+    else:
+        raise ValueError("Unsupported Meta recipient type")
+    return {
+        "recipient": recipient,
+        "message": {"text": text},
+        "messaging_type": "RESPONSE",
+    }
 
 
 def _truncate_log_text(text: str, limit: int = 300) -> str:
@@ -113,8 +161,27 @@ async def get_account_by_page_id(session: AsyncSession, page_id: str) -> Account
     return result.scalar_one_or_none()
 
 # --- Live Chat Notification ---
-async def notify_live_chat(account_id: int, sender_id: str, text: str, user_name: str = "Unknown"):
+async def _tenant_live_chat_recipients(account_id: int) -> list[int]:
+    """Resolve only operators explicitly linked to the message's tenant."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(AdminUser.telegram_id).where(AdminUser.account_id == account_id)
+        )
+        return list(dict.fromkeys(result.scalars().all()))
+
+
+async def notify_live_chat(
+    account_id: int, sender_id: str, text: str, user_name: str = "Unknown"
+):
     try:
+        recipients = await _tenant_live_chat_recipients(account_id)
+        if not recipients:
+            logger.warning(
+                "Live chat notification skipped account=%s reason=no_tenant_recipients",
+                account_id,
+            )
+            return
+
         bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 رد (Live Chat)", callback_data=f"reply_to:{account_id}:{sender_id}")]
@@ -124,12 +191,14 @@ async def notify_live_chat(account_id: int, sender_id: str, text: str, user_name
             f"👤: {html.escape(user_name)} (ID: {html.escape(sender_id)})\n"
             f"📄: {html.escape(text)}"
         )
-        for admin_id in settings.ADMIN_IDS:
-            try:
-                await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML", reply_markup=keyboard)
-            except Exception as exc:
-                logger.error("Failed to notify admin error_type=%s", type(exc).__name__)
-        await bot.session.close()
+        try:
+            for admin_id in recipients:
+                try:
+                    await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML", reply_markup=keyboard)
+                except Exception as exc:
+                    logger.error("Failed to notify admin error_type=%s", type(exc).__name__)
+        finally:
+            await bot.session.close()
     except Exception as exc:
         logger.error("Live chat notification failed error_type=%s", type(exc).__name__)
 
@@ -179,6 +248,7 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                 processed_count += 1
                 msg_data = json.loads(data)
                 recipient_id = msg_data["recipient_id"]
+                recipient_type = msg_data.get("recipient_type", "user")
                 text = msg_data["text"]
                 msg_account_id = msg_data.get("account_id")
                 delay = msg_data.get("delay", 0)
@@ -225,7 +295,9 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                         continue
                         
                 # Reliability: Conversation Lock
-                conversation_lock_token = await acquire_conversation_lock(account_id, recipient_id)
+                conversation_lock_token = await acquire_conversation_lock(
+                    account_id, f"{recipient_type}:{recipient_id}"
+                )
                 if not conversation_lock_token:
                     await retry_outbound_message(
                         account_id, data, msg_data, "ConversationBusy"
@@ -235,7 +307,13 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
 
                 try:
                     try:
-                            await send_instagram_message_api(account_id, recipient_id, text, token)
+                            await send_instagram_message_api(
+                                account_id,
+                                recipient_id,
+                                text,
+                                token,
+                                recipient_type=recipient_type,
+                            )
                     except DeliveryPolicyBlocked:
                         await retry_outbound_message(
                             account_id, data, msg_data, "DeliveryPolicyBlocked", max_attempts=1
@@ -277,7 +355,9 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                             await session.commit()
                             
                 finally:
-                    await release_conversation_lock(account_id, recipient_id, conversation_lock_token)
+                    await release_conversation_lock(
+                        account_id, f"{recipient_type}:{recipient_id}", conversation_lock_token
+                    )
                 
                 if single_pass:
                     # In single pass (worker pool), we might process just one or a small batch
@@ -295,29 +375,21 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
             await asyncio.sleep(1.0)
     return processed_count
 
-async def send_instagram_message_api(account_id: int, recipient_id: str, text: str, access_token: str):
+async def send_instagram_message_api(
+    account_id: int,
+    recipient_id: str,
+    text: str,
+    access_token: str,
+    recipient_type: str = "user",
+):
     url = f"{GRAPH_API_URL}/me/messages"
-    
-    is_within = await is_within_24h_window(account_id, recipient_id)
-    is_human_mode = await is_human_takeover_active(account_id, recipient_id)
-    
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE"
-    }
 
-    if is_within:
-        pass
-    elif is_human_mode:
-        # 24h Compliance Lock (Even for HUMAN_AGENT)
-        # "لا يسمح بالرد حتى لو HUMAN_AGENT إلا بعد رسالة جديدة من المستخدم"
-        # This implies we check if the user sent a message recently? 
-        # is_within_24h_window means "did user send msg in last 24h".
-        # If is_within is False, it means user hasn't sent msg in last 24h.
-        # So we strictly block if !is_within.
-        raise DeliveryPolicyBlocked("Outside24HourWindow")
-    else:
+    payload = build_instagram_message_payload(recipient_id, text, recipient_type)
+
+    # A Meta Private Reply is authorized by its comment ID and is not an ordinary
+    # continuation of a Direct Messaging conversation. Ordinary DMs retain the
+    # strict 24-hour policy guard.
+    if recipient_type == "user" and not await is_within_24h_window(account_id, recipient_id):
         raise DeliveryPolicyBlocked("Outside24HourWindow")
 
     params = {
@@ -422,9 +494,7 @@ async def _process_comment_change(change: dict, account: Account, session: Async
     if not reply_text:
         return
 
-    # Comment itself is treated as a fresh user interaction to pass local 24h window guard.
-    await update_last_interaction(account.id, commenter_id, timestamp=int(time.time()))
-    await enqueue_message(commenter_id, reply_text, account.id, delay=random.uniform(2, 8))
+    await enqueue_private_reply(comment_id, reply_text, account.id, delay=random.uniform(2, 8))
 
     user = await get_or_create_user(session, commenter_id, account.id, send_welcome=False)
     session.add(
@@ -440,14 +510,15 @@ async def _process_comment_change(change: dict, account: Account, session: Async
         ActivityEvent(
             account_id=account.id,
             event_type="COMMENT_DM_TRIGGERED",
-            details=f"Keyword: {matched_keyword} | User: {commenter_id} | CommentID: {comment_id}",
+            details=f"keyword={matched_keyword} recipient={_safe_subject(commenter_id)} comment={_safe_subject(comment_id)}",
         )
     )
     await session.commit()
 
 async def process_single_event(event: dict, account: Account, session: AsyncSession):
     message = event.get("message") or {}
-    stable_id = message.get("mid")
+    postback = event.get("postback") or {}
+    stable_id = message.get("mid") or postback.get("mid")
     if not stable_id:
         stable_id = hashlib.sha256(
             json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -472,7 +543,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
     timestamp = event.get("timestamp")
     message = event.get("message", {})
     mid = message.get("mid")
-    text = message.get("text")
+    text = extract_event_text(event)
     is_echo = message.get("is_echo", False)
     
     if is_echo:
@@ -493,6 +564,10 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
             if conv:
                 await track_conversation_depth(account.id, conv.id, "outgoing")
                 
+        return
+
+    if not sender_id:
+        logger.warning("Webhook message missing sender")
         return
 
     if not text:
@@ -570,6 +645,54 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         )
         session.add(new_msg)
         await session.commit()
+        return
+
+    business_hours = await get_business_hours(session, account.id)
+    if not is_business_open(business_hours):
+        if await is_rate_limited(account.id, sender_id):
+            user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+            user.last_reply_status = "RATE_LIMITED"
+            session.add(user)
+            await session.commit()
+            return
+
+        if not await check_account_limits(account.id):
+            user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+            user.last_reply_status = "PLAN_LIMIT_REACHED"
+            session.add(user)
+            await session.commit()
+            return
+
+        await update_last_interaction(
+            account.id, sender_id, timestamp=int(timestamp) if timestamp else None
+        )
+        user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+        user.last_reply_status = "AFTER_HOURS"
+        session.add(user)
+        session.add(
+            Message(
+                account_id=account.id,
+                user_id=user.id,
+                content=text,
+                direction=MessageDirection.INCOMING,
+                mid=mid,
+            )
+        )
+        session.add(
+            ActivityEvent(
+                account_id=account.id,
+                event_type="AFTER_HOURS_RECEIVED",
+                details=f"sender={_safe_subject(sender_id)}",
+            )
+        )
+        await session.commit()
+        await enqueue_after_hours_notice(
+            sender_id,
+            business_hours["after_hours_text"],
+            account.id,
+            delay=random.uniform(1, 4),
+        )
+        await notify_live_chat(account.id, sender_id, text, user.full_name or "User")
         return
 
     # --- 3) Human Escalation Rule ---
