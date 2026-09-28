@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str
     API_V1_STR: str = "/api/v1"
     SECRET_KEY: str
+    OPS_API_KEY: str | None = None
     ENV: str = "production"
 
     # Database
