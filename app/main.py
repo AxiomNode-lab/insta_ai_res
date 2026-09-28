@@ -146,7 +146,8 @@ async def health_check():
             await session.execute(text("SELECT 1"))
         health_status["db"] = "healthy"
     except Exception as e:
-        health_status["db"] = f"unhealthy: {str(e)}"
+        health_status["db"] = "unhealthy"
+        logger.warning("Health check database failure", exc_info=True)
 
     # 2. Check Redis
     try:
@@ -159,7 +160,8 @@ async def health_check():
             health_status["system_status"] = "SAFE_MODE (PAUSED)"
             
     except Exception as e:
-        health_status["redis"] = f"unhealthy: {str(e)}"
+        health_status["redis"] = "unhealthy"
+        logger.warning("Health check Redis failure", exc_info=True)
         
     # 3. Check Meta Config (Global)
     if settings.INSTAGRAM_ACCESS_TOKEN and settings.META_APP_SECRET:
