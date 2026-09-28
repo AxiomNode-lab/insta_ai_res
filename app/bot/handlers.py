@@ -197,13 +197,6 @@ async def account_status(message: Message):
     
     await message.answer(text, parse_mode="HTML")
 
-@router.message(Command("throttle_account"))
-async def throttle_account(message: Message):
-    if not await check_permission(message, [AdminRole.OWNER]):
-        return
-    # Not fully implemented manual throttle override, but we can set safe mode
-    await message.answer("Use /quarantine {id} to stop processing.")
-
 @router.message(Command("quarantine"))
 async def quarantine_cmd(message: Message):
     if not await check_permission(message, [AdminRole.OWNER]):
