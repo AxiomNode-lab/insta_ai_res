@@ -123,7 +123,7 @@ app.include_router(legal.router, tags=["legal"])
 
 @app.get("/")
 async def root():
-    return {"message": "Instagram Auto Reply System is Running"}
+    return {"message": "IG Reply Desk is running"}
 
 @app.get("/health")
 async def health_check():
