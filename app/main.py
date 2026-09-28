@@ -15,7 +15,8 @@ from app.models import all_models
 from app.models.all_models import Account, AccountStatus
 from sqlalchemy import select
 from app.api import webhook
-from app.routers import ops, legal # New Legal Router
+from app.routers import ops, legal
+from app.routers.ops import require_ops_key # New Legal Router
 from app.bot.main import start_telegram_bot, stop_telegram_bot
 # from app.services.instagram_service import process_outgoing_queue # Deprecated in Phase 4
 from app.services.worker_pool_manager import worker_pool # New Worker Pool Manager
@@ -118,7 +119,7 @@ app = FastAPI(
 )
 
 app.include_router(webhook.router, prefix="/instagram", tags=["webhook"])
-app.include_router(ops.router, prefix="/ops", tags=["operations"])
+app.include_router(ops.router, prefix="/ops", tags=["operations"], dependencies=[Depends(require_ops_key)])
 app.include_router(legal.router, tags=["legal"])
 
 @app.get("/")
