@@ -48,19 +48,17 @@ Service URL:
 - `GET /instagram/webhook`: Meta verification endpoint
 - `POST /instagram/webhook`: incoming Instagram webhook events
 
-## Security hardening checklist
+## Security boundaries
 
-- Verify webhook signatures on every incoming Meta event.
-- Keep tokens and secrets only in environment variables (never in source control).
-- Rotate Meta and Telegram tokens on a fixed schedule.
-- Use least-privilege access for DB, Redis, and bot credentials.
-- Add rate limiting on public webhook routes.
-- Log events without leaking PII or credential values.
-- Restrict `/ops/*` endpoints behind authentication and role checks.
+- Meta webhook signatures are verified before processing events.
+- Secrets and access tokens are loaded from environment configuration, not source files.
+- Redis-backed user rate limiting is applied to incoming message processing.
+- Telegram operator actions use role checks.
+- Operational endpoints under `/ops/*` are internal interfaces and must not be exposed directly to the public internet.
+- Logs and operational output must not contain credentials or unnecessary personal data.
 
 ## Operational notes
 
 - Local startup creates required database tables.
 - Redis and Postgres must be healthy before handling production traffic.
 - Environment files, logs, and local artifacts are intentionally excluded from Git.
-- Documentation has been refreshed to improve operational clarity and security guidance.
