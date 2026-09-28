@@ -1,9 +1,16 @@
-from fastapi import APIRouter, Depends
+import hmac
+from fastapi import APIRouter, Depends, Header, HTTPException
 from app.core.redis_utils import get_redis_client, get_silence_metrics
 from app.core.config import settings
 import time
 
 router = APIRouter()
+
+async def require_ops_key(x_ops_key: str | None = Header(default=None)) -> None:
+    configured = settings.OPS_API_KEY
+    if not configured or not x_ops_key or not hmac.compare_digest(x_ops_key, configured):
+        raise HTTPException(status_code=404, detail="Not found")
+
 
 @router.get("/status")
 async def get_ops_status():
