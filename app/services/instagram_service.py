@@ -47,6 +47,7 @@ from app.core.redis_utils import (
     is_trust_recovery_mode,
     record_bot_like_start,
     stable_fingerprint,
+    normalize_timestamp_seconds,
 )
 from app.models.all_models import (
     Account,
@@ -550,6 +551,62 @@ def _safe_subject(value: object) -> str:
     return stable_fingerprint(str(value), length=12)
 
 
+def private_reply_comment_timestamp_allowed(
+    timestamp: object,
+    *,
+    now: datetime | None = None,
+    max_age_seconds: int = 7 * 24 * 60 * 60,
+) -> bool | None:
+    """Check Meta's private-reply window when the comment timestamp is supplied.
+
+    Returns None only when Meta did not provide a timestamp; in that case the
+    platform remains the final authority. Invalid, future, and expired supplied
+    timestamps fail closed.
+    """
+    if timestamp is None:
+        return None
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (str, int, float)):
+        return False
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current_epoch = current.timestamp()
+
+    try:
+        numeric_epoch = (
+            isinstance(timestamp, (int, float))
+            or (
+                isinstance(timestamp, str)
+                and bool(re.fullmatch(r"\\d+(?:\\.\\d+)?", timestamp.strip()))
+            )
+        )
+        if numeric_epoch:
+            normalized = normalize_timestamp_seconds(
+                timestamp,
+                now=current_epoch,
+                future_tolerance_seconds=0,
+            )
+            if normalized is None:
+                return False
+            posted_at = datetime.fromtimestamp(normalized, tz=timezone.utc)
+        else:
+            iso_value = timestamp.strip()
+            if not iso_value:
+                return False
+            if iso_value.endswith("Z"):
+                iso_value = iso_value[:-1] + "+00:00"
+            posted_at = datetime.fromisoformat(iso_value)
+            if posted_at.tzinfo is None:
+                posted_at = posted_at.replace(tzinfo=timezone.utc)
+            posted_at = posted_at.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return False
+
+    age_seconds = (current.astimezone(timezone.utc) - posted_at).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
+
+
 async def process_comment_change(change: dict, account: Account, session: AsyncSession):
     value = change.get("value") or {}
     comment_id = value.get("id") or value.get("comment_id")
@@ -584,6 +641,24 @@ async def _process_comment_change(change: dict, account: Account, session: Async
 
     if not comment_id or not isinstance(comment_text, str) or not comment_text.strip() or not commenter_id:
         return
+
+    comment_timestamp = value.get("timestamp")
+    timestamp_allowed = private_reply_comment_timestamp_allowed(comment_timestamp)
+    if timestamp_allowed is False:
+        session.add(
+            ActivityEvent(
+                account_id=account.id,
+                event_type="COMMENT_DM_BLOCKED",
+                details=f"reason=invalid_or_expired_timestamp comment={_safe_subject(comment_id)}",
+            )
+        )
+        await session.commit()
+        return
+    if timestamp_allowed is None:
+        logger.warning(
+            "Comment timestamp missing; relying on Meta private-reply enforcement account=%s",
+            account.id,
+        )
 
     # This feature is intentionally scoped to video comments. Meta separates
     # the publishing surface (media_product_type=FEED) from the media format
