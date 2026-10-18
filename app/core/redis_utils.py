@@ -454,6 +454,19 @@ async def acquire_queue_lock(lock_key: str, expiration: int = 30) -> bool:
     success = await client.set(lock_key, "1", ex=expiration, nx=True)
     return bool(success)
 
+_ENQUEUE_OUTBOUND_SCRIPT = """
+local depth = redis.call('LLEN', KEYS[1])
+  + redis.call('ZCARD', KEYS[2])
+  + redis.call('ZCARD', KEYS[3])
+if depth >= tonumber(ARGV[1]) then
+  return -1
+end
+redis.call('RPUSH', KEYS[1], ARGV[2])
+redis.call('SADD', KEYS[4], ARGV[3])
+return 1
+"""
+
+
 async def enqueue_message(
     recipient_id: str,
     text: str,
@@ -464,27 +477,35 @@ async def enqueue_message(
     if recipient_type not in {"user", "comment"}:
         raise ValueError("Unsupported Meta recipient type")
     client = await get_redis_client()
-    
-    # Backpressure check
-    if await check_throttling(account_id):
-        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
-
     queue_key = f"queue:{account_id}"
     payload = json.dumps({
         "job_id": uuid.uuid4().hex,
-        "recipient_id": recipient_id, 
+        "recipient_id": recipient_id,
         "recipient_type": recipient_type,
-        "text": text, 
+        "text": text,
         "account_id": account_id,
         "delay": delay,
         "attempt": 0,
         "queued_at": time.time(),
     }, separators=(",", ":"), sort_keys=True)
-    
-    pipe = client.pipeline()
-    pipe.rpush(queue_key, payload)
-    pipe.sadd(ACTIVE_ACCOUNTS_KEY, str(account_id))
-    await pipe.execute()
+
+    # Capacity check, queue insert, and active-account registration are one
+    # Redis operation. A burst of concurrent producers cannot overfill the cap.
+    result = int(
+        await client.eval(
+            _ENQUEUE_OUTBOUND_SCRIPT,
+            4,
+            queue_key,
+            f"queue:processing:{account_id}",
+            f"queue:retry:{account_id}",
+            ACTIVE_ACCOUNTS_KEY,
+            settings.OUTBOUND_QUEUE_MAX_DEPTH,
+            payload,
+            account_id,
+        )
+    )
+    if result < 0:
+        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
 
 
 async def enqueue_private_reply(comment_id: str, text: str, account_id: int, delay: float = 0):
