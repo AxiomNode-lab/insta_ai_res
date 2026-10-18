@@ -101,8 +101,11 @@ def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dic
         raise InvalidOutboundPayload("payload_not_object")
 
     raw_account_id = payload.get("account_id")
-    if isinstance(raw_account_id, bool) or raw_account_id is None:
-        raise InvalidOutboundPayload("missing_account_id")
+    if isinstance(raw_account_id, bool) or not (
+        isinstance(raw_account_id, int)
+        or (isinstance(raw_account_id, str) and raw_account_id.isdecimal())
+    ):
+        raise InvalidOutboundPayload("invalid_account_id")
     try:
         payload_account_id = int(raw_account_id)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -115,7 +118,7 @@ def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dic
         raise InvalidOutboundPayload("invalid_recipient_id")
 
     recipient_type = payload.get("recipient_type")
-    if recipient_type not in {"user", "comment"}:
+    if not isinstance(recipient_type, str) or recipient_type not in {"user", "comment"}:
         raise InvalidOutboundPayload("invalid_recipient_type")
 
     text = payload.get("text")
