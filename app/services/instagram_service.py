@@ -44,7 +44,8 @@ from app.core.redis_utils import (
     get_account_behavior_state,
     is_platform_behavior_risk,
     is_trust_recovery_mode,
-    record_bot_like_start
+    record_bot_like_start,
+    stable_fingerprint,
 )
 from app.models.all_models import (
     Account,
@@ -580,7 +581,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         return
         
     # --- 5) Follow-Up Cooldown Logic ---
-    text_hash = str(hash(clean_text))
+    text_hash = stable_fingerprint(clean_text)
     if await check_follow_up_cooldown(account.id, sender_id, text_hash):
         # User repeated message < 30s.
         # Don't reply immediately. Just ignore or delay?
@@ -878,14 +879,14 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         # If pattern is repeating, maybe escalate
         # We tracked reply above.
         # Here we just log if diversity is low.
-        struct_hash = hash(f"{text[:10]}-{reply_text[:10]}")
+        struct_hash = stable_fingerprint(f"{text[:10]}-{reply_text[:10]}")
         if await check_conversation_diversity(account.id, str(struct_hash)):
             # Escalation
             if random.random() < 0.3:
                  await set_human_takeover(account.id, sender_id, True)
                  return
 
-        lock_key = f"outgoing:{account.id}:{sender_id}:{hash(reply_text)}"
+        lock_key = f"outgoing:{account.id}:{sender_id}:{stable_fingerprint(reply_text)}"
         if await acquire_queue_lock(lock_key):
             try:
                 # --- 4) Random Response Timing ---
