@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/imedkablavi/insta_ai_res/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/imedkablavi/insta_ai_res/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/AxiomNode-lab/insta_ai_res/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/AxiomNode-lab/insta_ai_res/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white">
   <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-f59e0b">
@@ -65,7 +65,7 @@ Request processing is at-least-once:
 Requirements: Python 3.12, PostgreSQL, Redis, and Meta/Telegram test credentials.
 
 ```bash
-git clone https://github.com/imedkablavi/insta_ai_res.git
+git clone https://github.com/AxiomNode-lab/insta_ai_res.git
 cd insta_ai_res
 
 python -m venv .venv
@@ -160,7 +160,7 @@ The default suite uses synthetic payloads and mocked external boundaries. CI add
 - Real Meta sandbox verification and app review/permissions.
 - Meta user-data deletion callback and auditable deletion lifecycle.
 - Instagram Login OAuth onboarding and reauthorization UX.
-- Real Alembic revisions with upgrade and rollback tests.
+- Validate and adopt existing database schemas using the [migration guide](docs/DB_MIGRATIONS.md); backup and schema-drift review remain mandatory.
 - Staging exercises for Redis AOF recovery, PostgreSQL outage, and process-kill recovery.
 - A shared web inbox if the project expands beyond Telegram-based operations.
 
