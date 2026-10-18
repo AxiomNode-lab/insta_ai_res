@@ -550,7 +550,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
     if is_echo:
         if recipient_id:
             await set_human_takeover(account.id, recipient_id, active=True)
-            log = ActivityEvent(account_id=account.id, event_type="HUMAN_INTERVENTION", details=f"Admin replied to {recipient_id}")
+            log = ActivityEvent(account_id=account.id, event_type="HUMAN_INTERVENTION", details=f"recipient={_safe_subject(recipient_id)}")
             session.add(log)
             await session.commit()
             
@@ -710,7 +710,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         user.last_reply_status = "SALES_ESCALATION"
         session.add(user)
         
-        log = ActivityEvent(account_id=account.id, event_type="HUMAN_ESCALATION", details=f"Triggered by: {text}")
+        log = ActivityEvent(account_id=account.id, event_type="HUMAN_ESCALATION", details=f"reason=sales_escalation sender={_safe_subject(sender_id)}")
         session.add(log)
         await session.commit()
         
@@ -858,7 +858,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
             sale_keywords = ["عرض", "خصم", "اطلب", "سجل", "اشتر", "تواصل", "واتساب", "whatsapp"]
             normalized_reply = normalize_arabic(reply_text)
             if any(kw in normalized_reply for kw in sale_keywords):
-                log = ActivityEvent(account_id=account.id, event_type="POLICY_BLOCKED_SALES", details=f"Blocked sales reply to new user: {reply_text[:20]}...")
+                log = ActivityEvent(account_id=account.id, event_type="POLICY_BLOCKED_SALES", details=f"reason=new_user_sales_reply reply={stable_fingerprint(reply_text)}")
                 session.add(log)
                 user.last_reply_status = "SAFETY_BLOCKED_SALES"
                 session.add(user)
@@ -990,7 +990,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         is_suggested = await record_unknown_intent(account.id, text)
         if is_suggested:
             # Notify Admin
-             log = ActivityEvent(account_id=account.id, event_type="INTENT_SUGGESTION", details=f"Frequent unknown: {text}")
+             log = ActivityEvent(account_id=account.id, event_type="INTENT_SUGGESTION", details=f"unknown_intent_fingerprint={stable_fingerprint(text)}")
              session.add(log)
              await session.commit()
 
@@ -1010,7 +1010,7 @@ async def get_or_create_user(
         await session.commit()
         await session.refresh(user)
         
-        log = ActivityEvent(account_id=account_id, event_type="NEW_USER", details=f"IG: {ig_id}")
+        log = ActivityEvent(account_id=account_id, event_type="NEW_USER", details=f"instagram_user={_safe_subject(ig_id)}")
         session.add(log)
         await session.commit()
         if send_welcome:
