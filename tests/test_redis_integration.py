@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.core.redis_utils import (
     QueueBackpressure,
     close_redis_pool,
+    check_account_limits,
     enqueue_after_hours_notice,
     enqueue_message,
     get_redis_client,
@@ -89,5 +90,41 @@ async def test_outbound_queue_capacity_is_atomic_under_concurrent_writers(monkey
     finally:
         await client.delete(queue_key, processing_key, retry_key)
         await client.srem("active_accounts_set", str(account_id))
+        await client.aclose()
+        await close_redis_pool()
+
+
+
+@pytest.mark.asyncio
+async def test_account_hourly_and_daily_limits_are_atomic(monkeypatch):
+    account_id = 991_339
+    keys = [
+        f"safe_mode:acc:{account_id}",
+        f"quarantine:acc:{account_id}",
+        f"limit:acc:{account_id}:hour",
+        f"limit:acc:{account_id}:day",
+    ]
+    client = await get_redis_client()
+
+    try:
+        await client.delete(*keys)
+
+        async def try_accept() -> bool:
+            return await check_account_limits(
+                account_id, max_hour=1, max_day=1, hour_period=3600, day_period=86400
+            )
+
+        accepted = await asyncio.gather(*(try_accept() for _ in range(12)))
+
+        assert sum(accepted) == 1
+        assert int(await client.get(f"limit:acc:{account_id}:hour")) == 1
+        assert int(await client.get(f"limit:acc:{account_id}:day")) == 1
+
+        await client.set(f"safe_mode:acc:{account_id}", "1", ex=60)
+        assert not await check_account_limits(
+            account_id, max_hour=2, max_day=2
+        )
+    finally:
+        await client.delete(*keys)
         await client.aclose()
         await close_redis_pool()
