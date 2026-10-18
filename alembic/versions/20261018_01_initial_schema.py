@@ -116,11 +116,11 @@ def upgrade() -> None:
         sa.Column("last_reply_status", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.Index("idx_users_account_ig", "account_id", "ig_id"),
     )
     op.create_index("ix_users_id", "users", ["id"])
     op.create_index("ix_users_account_id", "users", ["account_id"])
     op.create_index("ix_users_ig_id", "users", ["ig_id"])
+    op.create_index("idx_users_account_ig", "users", ["account_id", "ig_id"])
 
     op.create_table(
         "messages",
@@ -131,12 +131,12 @@ def upgrade() -> None:
         sa.Column("direction", _enum("messagedirection"), nullable=False),
         sa.Column("timestamp", sa.DateTime(), nullable=False),
         sa.Column("mid", sa.String(), nullable=True),
-        sa.Index("idx_messages_account_created", "account_id", "timestamp"),
-        sa.Index("idx_messages_account_user", "account_id", "user_id"),
     )
     op.create_index("ix_messages_id", "messages", ["id"])
     op.create_index("ix_messages_account_id", "messages", ["account_id"])
     op.create_index("ix_messages_mid", "messages", ["mid"])
+    op.create_index("idx_messages_account_created", "messages", ["account_id", "timestamp"])
+    op.create_index("idx_messages_account_user", "messages", ["account_id", "user_id"])
 
     op.create_table(
         "auto_replies",
@@ -147,11 +147,11 @@ def upgrade() -> None:
         sa.Column("match_type", _enum("matchtype"), nullable=False),
         sa.Column("is_active", sa.Boolean(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Index("idx_autoreplies_account_keyword", "account_id", "keyword"),
     )
     op.create_index("ix_auto_replies_id", "auto_replies", ["id"])
     op.create_index("ix_auto_replies_account_id", "auto_replies", ["account_id"])
     op.create_index("ix_auto_replies_keyword", "auto_replies", ["keyword"])
+    op.create_index("idx_autoreplies_account_keyword", "auto_replies", ["account_id", "keyword"])
 
     op.create_table(
         "conversations",
@@ -163,10 +163,10 @@ def upgrade() -> None:
         sa.Column("msg_count_user", sa.Integer(), nullable=False),
         sa.Column("msg_count_bot", sa.Integer(), nullable=False),
         sa.Column("quality_score", _enum("conversationquality"), nullable=False),
-        sa.Index("idx_conversations_account_last_interaction", "account_id", "last_interaction"),
     )
     op.create_index("ix_conversations_id", "conversations", ["id"])
     op.create_index("ix_conversations_account_id", "conversations", ["account_id"])
+    op.create_index("idx_conversations_account_last_interaction", "conversations", ["account_id", "last_interaction"])
 
     op.create_table(
         "settings",
