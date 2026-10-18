@@ -54,7 +54,7 @@ jobs:
         image: postgres:15-alpine
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: "post%gres-password"
           POSTGRES_DB: insta_test
         ports:
           - 5432:5432
@@ -70,10 +70,10 @@ jobs:
       SECRET_KEY: "test-secret-key-not-for-production"
       POSTGRES_SERVER: "127.0.0.1"
       POSTGRES_USER: "postgres"
-      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_PASSWORD: "post%gres-password"
       POSTGRES_DB: "insta_test"
       POSTGRES_PORT: "5432"
-      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/insta_test"
+      DATABASE_URL: ""
       REDIS_URL: "redis://127.0.0.1:6379/15"
       META_APP_SECRET: "meta-current-test-secret"
       META_VERIFY_TOKEN: "verify-test-token"
