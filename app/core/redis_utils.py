@@ -3,6 +3,7 @@ import hmac
 import redis.asyncio as redis
 from app.core.config import settings
 import json
+import math
 import time
 import uuid
 
@@ -429,22 +430,89 @@ async def is_human_takeover_active(account_id: int, user_id: str) -> bool:
     return await client.exists(key)
 
 # --- 24h Window Management ---
-async def update_last_interaction(account_id: int, user_id: str, timestamp: int = None):
+def normalize_timestamp_seconds(
+    timestamp: object,
+    *,
+    now: float | None = None,
+    future_tolerance_seconds: int = 300,
+) -> int | None:
+    """Normalize Meta webhook epochs (seconds or milliseconds) to seconds.
+
+    Instagram messaging webhooks commonly send event timestamps in milliseconds.
+    Reject malformed, non-finite, non-positive, or implausibly future values so
+    bad timestamps cannot accidentally open the messaging window.
+    """
+    if timestamp is None or isinstance(timestamp, bool):
+        return None
+    if not isinstance(timestamp, (int, float, str)):
+        return None
+
+    try:
+        value = float(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+
+    # Current epoch in milliseconds is around 1e12; seconds are around 1e9.
+    if value >= 100_000_000_000:
+        value /= 1000.0
+    if not math.isfinite(value) or value <= 0:
+        return None
+
+    reference_now = float(time.time() if now is None else now)
+    if not math.isfinite(reference_now) or reference_now <= 0:
+        return None
+    if value > reference_now + max(0, future_tolerance_seconds):
+        return None
+    return int(value)
+
+
+async def update_last_interaction(
+    account_id: int,
+    user_id: str,
+    timestamp: int | float | str | None = None,
+):
     client = await get_redis_client()
     key = f"last_interaction:{account_id}:{user_id}"
-    ts = timestamp if timestamp else int(time.time())
+
+    if timestamp is None:
+        ts = int(time.time())
+    else:
+        ts = normalize_timestamp_seconds(timestamp)
+        if ts is None:
+            # Do not replace a known-good timestamp with malformed/future input.
+            return
     await client.set(key, ts)
 
-async def is_within_24h_window(account_id: int, user_id: str, current_timestamp: int = None) -> bool:
+
+async def is_within_24h_window(
+    account_id: int,
+    user_id: str,
+    current_timestamp: int | float | str | None = None,
+) -> bool:
     client = await get_redis_client()
     key = f"last_interaction:{account_id}:{user_id}"
     last_time = await client.get(key)
-    
-    if not last_time:
+
+    if last_time is None:
         return False
-        
-    now = current_timestamp if current_timestamp else int(time.time())
-    return (now - int(last_time)) < 86400
+
+    if current_timestamp is None:
+        now = int(time.time())
+    else:
+        now = normalize_timestamp_seconds(current_timestamp)
+        if now is None:
+            return False
+
+    # Also normalize legacy millisecond values already stored by earlier versions.
+    last_seconds = normalize_timestamp_seconds(last_time, now=now)
+    if last_seconds is None:
+        return False
+
+    age_seconds = now - last_seconds
+    # Fail closed when the stored timestamp is in the future.
+    return 0 <= age_seconds < 86_400
 
 # --- Multi-Tenant Queue & Idempotency ---
 ACTIVE_ACCOUNTS_KEY = "active_accounts_set"
