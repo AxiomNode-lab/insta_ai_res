@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core import redis_utils
+from app.services.instagram_service import _safe_subject
 
 
 def _fingerprint_in_child(hash_seed: str) -> str:
@@ -73,3 +74,10 @@ async def test_redis_pattern_cooldown_and_unknown_intent_keys_use_stable_fingerp
         call.args[0] for call in client.incr.await_args_list[2:]
     ]
     assert unknown_keys[0] == unknown_keys[1]
+
+
+def test_safe_subject_uses_the_keyed_stable_fingerprint():
+    assert _safe_subject("123456789") == redis_utils.stable_fingerprint(
+        "123456789", length=12
+    )
+    assert _safe_subject("123456789") != "123456789"
