@@ -35,6 +35,8 @@ def test_valid_outbound_payload_is_normalized_before_delivery():
         json.dumps({"recipient_id": "synthetic-recipient", "recipient_type": "user", "text": "Hello"}),
         json.dumps({"account_id": 42, "recipient_id": "", "recipient_type": "user", "text": "Hello"}),
         json.dumps({"account_id": 42, "recipient_id": "synthetic-recipient", "recipient_type": "page", "text": "Hello"}),
+        json.dumps({"account_id": 42, "recipient_id": "synthetic-recipient", "recipient_type": [], "text": "Hello"}),
+        json.dumps({"account_id": 42.5, "recipient_id": "synthetic-recipient", "recipient_type": "user", "text": "Hello"}),
         json.dumps({"account_id": 42, "recipient_id": "synthetic-recipient", "recipient_type": "user", "text": ""}),
         json.dumps({"account_id": 42, "recipient_id": "synthetic-recipient", "recipient_type": "user", "text": "Hello", "delay": "5"}),
         json.dumps({"account_id": 42, "recipient_id": "synthetic-recipient", "recipient_type": "user", "text": "Hello", "delay": -1}),
