@@ -361,33 +361,54 @@ async def get_metrics(account_id: int) -> dict:
     }
 
 # --- Account Limits & Safe Mode & Quarantine ---
-async def check_account_limits(account_id: int) -> bool:
-    if await is_account_safe_mode(account_id) or await is_account_quarantined(account_id):
-        return False
+_CHECK_ACCOUNT_LIMITS_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+local hour_count = tonumber(redis.call('GET', KEYS[3]) or '0')
+local day_count = tonumber(redis.call('GET', KEYS[4]) or '0')
+if hour_count >= tonumber(ARGV[1]) or day_count >= tonumber(ARGV[2]) then
+  return 0
+end
+local next_hour = redis.call('INCR', KEYS[3])
+if next_hour == 1 then
+  redis.call('EXPIRE', KEYS[3], ARGV[3])
+end
+local next_day = redis.call('INCR', KEYS[4])
+if next_day == 1 then
+  redis.call('EXPIRE', KEYS[4], ARGV[4])
+end
+return 1
+"""
+
+
+async def check_account_limits(
+    account_id: int,
+    *,
+    max_hour: int = 40,
+    max_day: int = 400,
+    hour_period: int = 3600,
+    day_period: int = 86_400,
+) -> bool:
+    """Atomically enforce hourly/daily limits and increment accepted activity."""
+    if min(max_hour, max_day, hour_period, day_period) < 1:
+        raise ValueError("account limits and periods must be positive")
 
     client = await get_redis_client()
-    hour_key = f"limit:acc:{account_id}:hour"
-    day_key = f"limit:acc:{account_id}:day"
-    
-    hour_count = await client.get(hour_key)
-    day_count = await client.get(day_key)
-    
-    max_hour = 40
-    max_day = 400
-    
-    if hour_count and int(hour_count) >= max_hour:
-        return False
-    if day_count and int(day_count) >= max_day:
-        return False
-        
-    pipe = client.pipeline()
-    pipe.incr(hour_key)
-    pipe.expire(hour_key, 3600)
-    pipe.incr(day_key)
-    pipe.expire(day_key, 86400)
-    await pipe.execute()
-    
-    return True
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    result = await client.eval(
+        _CHECK_ACCOUNT_LIMITS_SCRIPT,
+        4,
+        f"safe_mode:acc:{account_id}",
+        f"quarantine:acc:{account_id}",
+        f"limit:acc:{account_id}:hour",
+        f"limit:acc:{account_id}:day:{today}",
+        max_hour,
+        max_day,
+        hour_period,
+        day_period,
+    )
+    return bool(result)
 
 async def is_account_safe_mode(account_id: int) -> bool:
     client = await get_redis_client()
