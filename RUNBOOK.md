@@ -113,7 +113,7 @@ Never paste a secret, webhook payload, sender ID, message body, Redis job, or da
 
 1. Build an immutable image from the reviewed commit. Do not mount the source tree into the production container.
 2. Supply secrets from the deployment secret store; `ENV=production` must be enabled.
-3. Apply reviewed database migrations before starting the new application. Keep `DB_AUTO_CREATE_SCHEMA=false`.
+3. Follow [the database migration guide](docs/DB_MIGRATIONS.md) for a fresh database or for safely adopting an existing legacy schema. Apply reviewed migrations before starting the new application. Keep `DB_AUTO_CREATE_SCHEMA=false`.
 4. Validate `docker compose -f docker-compose.prod.yml config`; confirm Redis AOF, `noeviction`, authentication, internal data network, read-only app filesystem, dropped capabilities, and resource limits remain present.
 5. Start one application instance. The Telegram bot and schedulers are currently embedded; multiple replicas require separating singleton roles first.
 6. Wait for `/health/ready` to return `200`, then send the synthetic signed webhook smoke test from `tests/test_webhook_lifecycle.py`.
