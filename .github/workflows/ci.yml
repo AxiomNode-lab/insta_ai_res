@@ -45,6 +45,70 @@ jobs:
           PYTHONPATH: .
         run: python -m pytest -q
 
+  migrations:
+    name: PostgreSQL migration lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: insta_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d insta_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      PROJECT_NAME: "IG Reply Desk Migration Test"
+      API_V1_STR: "/api/v1"
+      ENV: "test"
+      SECRET_KEY: "test-secret-key-not-for-production"
+      POSTGRES_SERVER: "127.0.0.1"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: "insta_test"
+      POSTGRES_PORT: "5432"
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/insta_test"
+      REDIS_URL: "redis://127.0.0.1:6379/15"
+      META_APP_SECRET: "meta-current-test-secret"
+      META_VERIFY_TOKEN: "verify-test-token"
+      INSTAGRAM_ACCESS_TOKEN: "instagram-test-token"
+      INSTAGRAM_PAGE_ID: "page-test-id"
+      TELEGRAM_BOT_TOKEN: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+      ADMIN_IDS: "[123456789]"
+      OPS_API_TOKEN: "ops-test-token"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install locked dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Upgrade an empty database
+        run: python -m alembic upgrade head
+
+      - name: Check migration metadata matches the ORM
+        run: python -m alembic check
+
+      - name: Verify downgrade and clean re-upgrade
+        run: |
+          python -m alembic downgrade base
+          python -m alembic upgrade head
+
   redis-integration:
     name: Redis atomicity
     runs-on: ubuntu-latest
