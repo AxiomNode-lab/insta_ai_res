@@ -486,11 +486,24 @@ async def send_instagram_message_api(
         try:
             response = await client.post(url, params=params, json=payload)
             response.raise_for_status()
-            logger.info("Message sent recipient=%s", _safe_subject(recipient_id))
-            # --- Track Outgoing for Silence Detection ---
+            logger.info("Message accepted by Meta recipient=%s", _safe_subject(recipient_id))
+
+            # Delivery already succeeded. Telemetry must never turn that success
+            # into a retry, which could duplicate the customer's message.
             from app.core.redis_utils import track_outgoing_message
-            await track_outgoing_message(1)
-            return response.json()
+            try:
+                await track_outgoing_message(1)
+            except Exception as metric_exc:
+                logger.warning(
+                    "Outgoing delivery metric unavailable error_type=%s",
+                    type(metric_exc).__name__,
+                )
+
+            try:
+                return response.json()
+            except ValueError:
+                logger.warning("Meta accepted message but returned a non-JSON response")
+                return {}
         except httpx.HTTPStatusError as e:
             error_message = _format_http_error(e.response)
             logger.error("Meta send failed %s", error_message)
