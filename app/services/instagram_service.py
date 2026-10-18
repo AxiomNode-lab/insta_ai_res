@@ -5,7 +5,7 @@ import logging
 import asyncio
 import random
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from multiprocessing import Event
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -578,7 +578,7 @@ def private_reply_comment_timestamp_allowed(
             isinstance(timestamp, (int, float))
             or (
                 isinstance(timestamp, str)
-                and bool(re.fullmatch(r"\\d+(?:\\.\\d+)?", timestamp.strip()))
+                and bool(re.fullmatch(r"\d+(?:\.\d+)?", timestamp.strip()))
             )
         )
         if numeric_epoch:
