@@ -180,6 +180,76 @@ async def test_comment_rule_queues_one_meta_private_reply_to_comment():
 
 
 @pytest.mark.asyncio
+async def test_feed_hosted_video_comment_can_trigger_private_reply():
+    session = SimpleNamespace(add=lambda _value: None, commit=AsyncMock())
+    account = SimpleNamespace(id=7)
+    change = {
+        "field": "comments",
+        "value": {
+            "id": "feed-video-comment",
+            "text": "كم السعر؟",
+            "from": {"id": "synthetic-user"},
+            "media": {"media_product_type": "FEED", "media_type": "VIDEO"},
+        },
+    }
+
+    with (
+        patch(
+            "app.services.instagram_service.get_comment_dm_rules",
+            AsyncMock(return_value=[{"keyword": "السعر", "response": "السعر 10"}]),
+        ),
+        patch(
+            "app.services.instagram_service.enqueue_private_reply",
+            new_callable=AsyncMock,
+        ) as enqueue,
+        patch(
+            "app.services.instagram_service.get_or_create_user",
+            AsyncMock(return_value=SimpleNamespace(id=99)),
+        ),
+        patch("app.services.instagram_service.random.uniform", return_value=3),
+    ):
+        await _process_comment_change(change, account, session)
+
+    enqueue.assert_awaited_once_with("feed-video-comment", "السعر 10", 7, delay=3)
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_photo_feed_comment_is_ignored_by_video_only_automation():
+    session = SimpleNamespace(add=MagicMock(), commit=AsyncMock())
+    account = SimpleNamespace(id=7)
+    change = {
+        "field": "comments",
+        "value": {
+            "id": "feed-photo-comment",
+            "text": "كم السعر؟",
+            "from": {"id": "synthetic-user"},
+            "media": {"media_product_type": "FEED", "media_type": "IMAGE"},
+        },
+    }
+
+    with (
+        patch(
+            "app.services.instagram_service.get_comment_dm_rules",
+            AsyncMock(return_value=[{"keyword": "السعر", "response": "السعر 10"}]),
+        ),
+        patch(
+            "app.services.instagram_service.enqueue_private_reply",
+            new_callable=AsyncMock,
+        ) as enqueue,
+        patch(
+            "app.services.instagram_service.get_or_create_user",
+            new_callable=AsyncMock,
+        ) as get_user,
+    ):
+        await _process_comment_change(change, account, session)
+
+    enqueue.assert_not_awaited()
+    get_user.assert_not_awaited()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_after_hours_path_applies_user_limit_before_storage_or_notification():
     session = SimpleNamespace(add=MagicMock(), commit=AsyncMock())
     account = SimpleNamespace(id=7)
