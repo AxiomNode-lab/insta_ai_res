@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import redis.asyncio as redis
 from app.core.config import settings
 import json
@@ -11,6 +13,20 @@ _redis_pool = None
 
 class QueueBackpressure(RuntimeError):
     pass
+
+
+def stable_fingerprint(value: str, length: int = 32) -> str:
+    """Return a cross-process, keyed fingerprint for Redis keys and deduplication.
+
+    Python's built-in hash() is randomized per interpreter process, so it must
+    never be used in keys shared by multiple workers.
+    """
+    digest = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        str(value).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:length]
 
 async def init_redis_pool():
     global _redis_pool
@@ -127,7 +143,7 @@ async def record_global_reply_pattern(account_id: int, text: str):
     Tracks reply patterns across all accounts to detect bot networks.
     """
     client = await get_redis_client()
-    text_hash = hash(text.strip().lower()[:100])
+    text_hash = stable_fingerprint(text.strip().lower()[:100])
     now_min = int(time.time() / 60)
     
     # Track accounts using this reply in this minute
@@ -673,7 +689,7 @@ async def check_daily_conversation_limit(account_id: int, max_limit: int = 120) 
 
 async def check_reply_repetition(account_id: int, text: str, max_limit: int = 50) -> bool:
     client = await get_redis_client()
-    text_hash = hash(text)
+    text_hash = stable_fingerprint(text)
     key = f"reply_repetition:{account_id}:{text_hash}"
     current = await client.incr(key)
     if current == 1:
@@ -707,7 +723,7 @@ async def record_unknown_intent(account_id: int, text: str) -> bool:
     client = await get_redis_client()
     # Normalize text (basic)
     norm_text = text.strip().lower()[:50] # Limit length
-    text_hash = hash(norm_text)
+    text_hash = stable_fingerprint(norm_text)
     
     key = f"unknown_intent:{account_id}:{text_hash}"
     count = await client.incr(key)
