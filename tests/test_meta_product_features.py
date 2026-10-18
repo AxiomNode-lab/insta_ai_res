@@ -15,6 +15,7 @@ from app.services.instagram_service import (
     build_instagram_message_payload,
     extract_event_text,
     notify_live_chat,
+    private_reply_comment_timestamp_allowed,
     send_instagram_message_api,
 )
 
@@ -177,6 +178,70 @@ async def test_comment_rule_queues_one_meta_private_reply_to_comment():
 
     enqueue.assert_awaited_once_with("comment-123", "السعر 10", 7, delay=3)
     session.commit.assert_awaited_once()
+
+
+def test_private_reply_timestamp_accepts_recent_iso_timestamp():
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    timestamp = "2026-10-18T11:59:00+0000"
+
+    assert private_reply_comment_timestamp_allowed(timestamp, now=now) is True
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2026-10-11T11:59:59+0000",
+        "not-a-timestamp",
+        "2026-10-18T12:01:00+0000",
+    ],
+)
+def test_private_reply_timestamp_rejects_expired_invalid_or_future_values(timestamp):
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+
+    assert private_reply_comment_timestamp_allowed(timestamp, now=now) is False
+
+
+def test_private_reply_timestamp_accepts_epoch_milliseconds_and_marks_missing_unknown():
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    recent_ms = int(now.timestamp() * 1000) - 60_000
+
+    assert private_reply_comment_timestamp_allowed(recent_ms, now=now) is True
+    assert private_reply_comment_timestamp_allowed(None, now=now) is None
+
+
+@pytest.mark.asyncio
+async def test_expired_comment_is_blocked_before_enqueue_and_audited():
+    session = SimpleNamespace(add=MagicMock(), commit=AsyncMock())
+    account = SimpleNamespace(id=7)
+    change = {
+        "field": "comments",
+        "value": {
+            "id": "expired-comment",
+            "text": "كم السعر؟",
+            "timestamp": "2026-10-10T12:00:00+0000",
+            "from": {"id": "synthetic-user"},
+            "media": {"media_product_type": "REELS"},
+        },
+    }
+
+    with (
+        patch(
+            "app.services.instagram_service.enqueue_private_reply",
+            new_callable=AsyncMock,
+        ) as enqueue,
+        patch(
+            "app.services.instagram_service.get_comment_dm_rules",
+            new_callable=AsyncMock,
+        ) as get_rules,
+    ):
+        await _process_comment_change(change, account, session)
+
+    enqueue.assert_not_awaited()
+    get_rules.assert_not_awaited()
+    session.commit.assert_awaited_once()
+    event = session.add.call_args.args[0]
+    assert event.event_type == "COMMENT_DM_BLOCKED"
+    assert "expired-comment" not in event.details
 
 
 @pytest.mark.asyncio
