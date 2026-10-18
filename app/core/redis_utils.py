@@ -543,14 +543,22 @@ async def acquire_queue_lock(lock_key: str, expiration: int = 30) -> bool:
     return bool(success)
 
 _ENQUEUE_OUTBOUND_SCRIPT = """
+local idempotency_ttl = tonumber(ARGV[4]) or 0
+if idempotency_ttl > 0 and redis.call('EXISTS', KEYS[5]) == 1 then
+  return 0
+end
 local depth = redis.call('LLEN', KEYS[1])
   + redis.call('ZCARD', KEYS[2])
   + redis.call('ZCARD', KEYS[3])
 if depth >= tonumber(ARGV[1]) then
   return -1
 end
-redis.call('RPUSH', KEYS[1], ARGV[2])
+-- LPUSH + worker RPOP preserves FIFO delivery order.
+redis.call('LPUSH', KEYS[1], ARGV[2])
 redis.call('SADD', KEYS[4], ARGV[3])
+if idempotency_ttl > 0 then
+  redis.call('SET', KEYS[5], ARGV[5], 'EX', idempotency_ttl)
+end
 return 1
 """
 
@@ -561,7 +569,10 @@ async def enqueue_message(
     account_id: int,
     delay: float = 0,
     recipient_type: str = "user",
-):
+    *,
+    idempotency_key: str | None = None,
+    idempotency_ttl: int | None = None,
+) -> bool:
     if recipient_type not in {"user", "comment"}:
         raise ValueError("Unsupported Meta recipient type")
     client = await get_redis_client()
@@ -577,33 +588,51 @@ async def enqueue_message(
         "queued_at": time.time(),
     }, separators=(",", ":"), sort_keys=True)
 
-    # Capacity check, queue insert, and active-account registration are one
-    # Redis operation. A burst of concurrent producers cannot overfill the cap.
+    dedupe_ttl = idempotency_ttl if idempotency_key is not None else 0
+    if dedupe_ttl is None:
+        dedupe_ttl = settings.WEBHOOK_DEDUP_TTL_SECONDS
+    if dedupe_ttl < 0:
+        raise ValueError("idempotency_ttl cannot be negative")
+    dedupe_key = (
+        f"outbound:dedupe:{stable_fingerprint(idempotency_key)}"
+        if idempotency_key is not None
+        else "outbound:dedupe:disabled"
+    )
+
+    # Capacity check, optional idempotency claim, queue insert, and active-account
+    # registration are a single Redis operation. A burst cannot overfill the cap
+    # or enqueue the same comment's private reply twice.
     result = int(
         await client.eval(
             _ENQUEUE_OUTBOUND_SCRIPT,
-            4,
+            5,
             queue_key,
             f"queue:processing:{account_id}",
             f"queue:retry:{account_id}",
             ACTIVE_ACCOUNTS_KEY,
+            dedupe_key,
             settings.OUTBOUND_QUEUE_MAX_DEPTH,
             payload,
             account_id,
+            dedupe_ttl,
+            json.loads(payload)["job_id"],
         )
     )
     if result < 0:
         raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
+    return result == 1
 
 
-async def enqueue_private_reply(comment_id: str, text: str, account_id: int, delay: float = 0):
-    """Queue Meta's one-time private reply addressed to the comment, not the user."""
-    await enqueue_message(
+async def enqueue_private_reply(comment_id: str, text: str, account_id: int, delay: float = 0) -> bool:
+    """Queue a one-time Meta private reply, idempotent per account and comment."""
+    return await enqueue_message(
         recipient_id=comment_id,
         text=text,
         account_id=account_id,
         delay=delay,
         recipient_type="comment",
+        idempotency_key=f"private-reply:{account_id}:{comment_id}",
+        idempotency_ttl=settings.WEBHOOK_DEDUP_TTL_SECONDS,
     )
 
 
@@ -618,7 +647,7 @@ if depth >= tonumber(ARGV[2]) then
   return -1
 end
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[3])
+redis.call('LPUSH', KEYS[2], ARGV[3])
 redis.call('SADD', KEYS[5], ARGV[4])
 return 1
 """
