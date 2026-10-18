@@ -533,7 +533,8 @@ class EventAlreadyProcessing(RuntimeError):
 
 
 def _safe_subject(value: object) -> str:
-    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+    """Create a stable, keyed pseudonym for identifiers in logs and activity details."""
+    return stable_fingerprint(str(value), length=12)
 
 
 async def process_comment_change(change: dict, account: Account, session: AsyncSession):
