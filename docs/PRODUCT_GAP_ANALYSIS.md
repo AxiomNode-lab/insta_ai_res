@@ -11,7 +11,7 @@ Despite the repository name, the current reply engine is deterministic. It norma
 | Capability | Before this branch | This branch | Remaining work |
 |---|---:|---:|---|
 | Direct-message keyword and exact rules | Yes | Yes | Visual flow builder and rule versioning |
-| Comment-to-private-reply | Incorrectly addressed as a normal user DM | Meta `comment_id` private reply | End-to-end sandbox test with a real Meta test account |
+| Comment-to-private-reply | Incorrectly addressed as a normal user DM | Meta `comment_id` private reply, one-enqueue dedupe, FIFO delivery, timestamp window gate when supplied | End-to-end sandbox test; verify login mode, external account ID, token, and correct send endpoint |
 | Ice Breaker / Persistent Menu postbacks | Ignored when no `message.text` existed | Postback and quick-reply payload ingestion | Admin publishing UI for menu/ice-breaker configuration |
 | Business hours | No | Per-account IANA timezone, weekday/overnight schedule, cooldown notice | Holiday exceptions and multiple daily intervals |
 | Human handoff | Telegram notification and human mode | Same | Shared web inbox, assignment, internal notes, SLA views |
@@ -21,11 +21,11 @@ Despite the repository name, the current reply engine is deterministic. It norma
 | Compliance callbacks | Privacy/terms pages and retention cleanup | Same | Meta user-data deletion callback and auditable deletion job |
 | Delivery UX | Text messages | Text plus postback inputs | Button/generic templates, sender actions, and supported attachments |
 | Meta API lifecycle | Hard-coded expired Graph API `v19.0` | Explicit configurable `v26.0` default | Quarterly compatibility review and sandbox upgrade gate |
-| Engineering delivery | Local integration tests | CI, 35 local tests, isolated Redis atomicity test, production-image build | PostgreSQL failover/process-kill tests and Meta sandbox smoke test |
+| Engineering delivery | Local integration tests | CI Python suite, isolated Redis atomicity/idempotency tests, PostgreSQL migration lifecycle, production-image build | PostgreSQL failover/process-kill tests and Meta sandbox smoke test |
 
 ## Why these additions were selected
 
-Meta documents Private Replies as a single message whose recipient contains the comment ID. Addressing the commenter as an ordinary DM both misrepresents the platform contract and incorrectly opens the service's local 24-hour window. This branch uses the comment ID and keeps ordinary DM window enforcement separate.
+Meta documents Private Replies as a single message whose recipient contains the comment ID. Addressing the commenter as an ordinary DM both misrepresents the platform contract and incorrectly opens the service's local 24-hour window. This branch uses the comment ID and keeps ordinary DM window enforcement separate. It only targets the configured video-comment scope (Reels/video/IGTV, including Feed-hosted videos) and rejects a supplied invalid or expired timestamp before enqueue. Meta's private-reply contract allows one message per comment within 7 days, except Instagram Live, where the response must be sent during the broadcast; live behavior is not covered by the current video-only rule. Missing webhook timestamps still rely on Meta's final enforcement.
 
 Meta's Ice Breakers, Persistent Menu, and Quick Replies all create structured selections/postbacks. Mapping their title or payload into the existing reply engine unlocks those native entry points without adding an unsafe broadcast system.
 
