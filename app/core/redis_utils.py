@@ -395,14 +395,13 @@ async def check_account_limits(
         raise ValueError("account limits and periods must be positive")
 
     client = await get_redis_client()
-    today = time.strftime("%Y-%m-%d", time.gmtime())
     result = await client.eval(
         _CHECK_ACCOUNT_LIMITS_SCRIPT,
         4,
         f"safe_mode:acc:{account_id}",
         f"quarantine:acc:{account_id}",
         f"limit:acc:{account_id}:hour",
-        f"limit:acc:{account_id}:day:{today}",
+        f"limit:acc:{account_id}:day",
         max_hour,
         max_day,
         hour_period,
