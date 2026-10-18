@@ -1,6 +1,9 @@
+import hashlib
+import hmac
 import redis.asyncio as redis
 from app.core.config import settings
 import json
+import math
 import time
 import uuid
 
@@ -11,6 +14,20 @@ _redis_pool = None
 
 class QueueBackpressure(RuntimeError):
     pass
+
+
+def stable_fingerprint(value: str, length: int = 32) -> str:
+    """Return a cross-process, keyed fingerprint for Redis keys and deduplication.
+
+    Python's built-in hash() is randomized per interpreter process, so it must
+    never be used in keys shared by multiple workers.
+    """
+    digest = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        str(value).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:length]
 
 async def init_redis_pool():
     global _redis_pool
@@ -127,7 +144,7 @@ async def record_global_reply_pattern(account_id: int, text: str):
     Tracks reply patterns across all accounts to detect bot networks.
     """
     client = await get_redis_client()
-    text_hash = hash(text.strip().lower()[:100])
+    text_hash = stable_fingerprint(text.strip().lower()[:100])
     now_min = int(time.time() / 60)
     
     # Track accounts using this reply in this minute
@@ -344,33 +361,53 @@ async def get_metrics(account_id: int) -> dict:
     }
 
 # --- Account Limits & Safe Mode & Quarantine ---
-async def check_account_limits(account_id: int) -> bool:
-    if await is_account_safe_mode(account_id) or await is_account_quarantined(account_id):
-        return False
+_CHECK_ACCOUNT_LIMITS_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+local hour_count = tonumber(redis.call('GET', KEYS[3]) or '0')
+local day_count = tonumber(redis.call('GET', KEYS[4]) or '0')
+if hour_count >= tonumber(ARGV[1]) or day_count >= tonumber(ARGV[2]) then
+  return 0
+end
+local next_hour = redis.call('INCR', KEYS[3])
+if next_hour == 1 then
+  redis.call('EXPIRE', KEYS[3], ARGV[3])
+end
+local next_day = redis.call('INCR', KEYS[4])
+if next_day == 1 then
+  redis.call('EXPIRE', KEYS[4], ARGV[4])
+end
+return 1
+"""
+
+
+async def check_account_limits(
+    account_id: int,
+    *,
+    max_hour: int = 40,
+    max_day: int = 400,
+    hour_period: int = 3600,
+    day_period: int = 86_400,
+) -> bool:
+    """Atomically enforce hourly/daily limits and increment accepted activity."""
+    if min(max_hour, max_day, hour_period, day_period) < 1:
+        raise ValueError("account limits and periods must be positive")
 
     client = await get_redis_client()
-    hour_key = f"limit:acc:{account_id}:hour"
-    day_key = f"limit:acc:{account_id}:day"
-    
-    hour_count = await client.get(hour_key)
-    day_count = await client.get(day_key)
-    
-    max_hour = 40
-    max_day = 400
-    
-    if hour_count and int(hour_count) >= max_hour:
-        return False
-    if day_count and int(day_count) >= max_day:
-        return False
-        
-    pipe = client.pipeline()
-    pipe.incr(hour_key)
-    pipe.expire(hour_key, 3600)
-    pipe.incr(day_key)
-    pipe.expire(day_key, 86400)
-    await pipe.execute()
-    
-    return True
+    result = await client.eval(
+        _CHECK_ACCOUNT_LIMITS_SCRIPT,
+        4,
+        f"safe_mode:acc:{account_id}",
+        f"quarantine:acc:{account_id}",
+        f"limit:acc:{account_id}:hour",
+        f"limit:acc:{account_id}:day",
+        max_hour,
+        max_day,
+        hour_period,
+        day_period,
+    )
+    return bool(result)
 
 async def is_account_safe_mode(account_id: int) -> bool:
     client = await get_redis_client()
@@ -413,22 +450,89 @@ async def is_human_takeover_active(account_id: int, user_id: str) -> bool:
     return await client.exists(key)
 
 # --- 24h Window Management ---
-async def update_last_interaction(account_id: int, user_id: str, timestamp: int = None):
+def normalize_timestamp_seconds(
+    timestamp: object,
+    *,
+    now: float | None = None,
+    future_tolerance_seconds: int = 300,
+) -> int | None:
+    """Normalize Meta webhook epochs (seconds or milliseconds) to seconds.
+
+    Instagram messaging webhooks commonly send event timestamps in milliseconds.
+    Reject malformed, non-finite, non-positive, or implausibly future values so
+    bad timestamps cannot accidentally open the messaging window.
+    """
+    if timestamp is None or isinstance(timestamp, bool):
+        return None
+    if not isinstance(timestamp, (int, float, str)):
+        return None
+
+    try:
+        value = float(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+
+    # Current epoch in milliseconds is around 1e12; seconds are around 1e9.
+    if value >= 100_000_000_000:
+        value /= 1000.0
+    if not math.isfinite(value) or value <= 0:
+        return None
+
+    reference_now = float(time.time() if now is None else now)
+    if not math.isfinite(reference_now) or reference_now <= 0:
+        return None
+    if value > reference_now + max(0, future_tolerance_seconds):
+        return None
+    return int(value)
+
+
+async def update_last_interaction(
+    account_id: int,
+    user_id: str,
+    timestamp: int | float | str | None = None,
+):
     client = await get_redis_client()
     key = f"last_interaction:{account_id}:{user_id}"
-    ts = timestamp if timestamp else int(time.time())
+
+    if timestamp is None:
+        ts = int(time.time())
+    else:
+        ts = normalize_timestamp_seconds(timestamp)
+        if ts is None:
+            # Do not replace a known-good timestamp with malformed/future input.
+            return
     await client.set(key, ts)
 
-async def is_within_24h_window(account_id: int, user_id: str, current_timestamp: int = None) -> bool:
+
+async def is_within_24h_window(
+    account_id: int,
+    user_id: str,
+    current_timestamp: int | float | str | None = None,
+) -> bool:
     client = await get_redis_client()
     key = f"last_interaction:{account_id}:{user_id}"
     last_time = await client.get(key)
-    
-    if not last_time:
+
+    if last_time is None:
         return False
-        
-    now = current_timestamp if current_timestamp else int(time.time())
-    return (now - int(last_time)) < 86400
+
+    if current_timestamp is None:
+        now = int(time.time())
+    else:
+        now = normalize_timestamp_seconds(current_timestamp)
+        if now is None:
+            return False
+
+    # Also normalize legacy millisecond values already stored by earlier versions.
+    last_seconds = normalize_timestamp_seconds(last_time, now=now)
+    if last_seconds is None:
+        return False
+
+    age_seconds = now - last_seconds
+    # Fail closed when the stored timestamp is in the future.
+    return 0 <= age_seconds < 86_400
 
 # --- Multi-Tenant Queue & Idempotency ---
 ACTIVE_ACCOUNTS_KEY = "active_accounts_set"
@@ -438,28 +542,158 @@ async def acquire_queue_lock(lock_key: str, expiration: int = 30) -> bool:
     success = await client.set(lock_key, "1", ex=expiration, nx=True)
     return bool(success)
 
-async def enqueue_message(recipient_id: str, text: str, account_id: int, delay: float = 0):
-    client = await get_redis_client()
-    
-    # Backpressure check
-    if await check_throttling(account_id):
-        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
+_ENQUEUE_OUTBOUND_SCRIPT = """
+local idempotency_ttl = tonumber(ARGV[4]) or 0
+if idempotency_ttl > 0 and redis.call('EXISTS', KEYS[5]) == 1 then
+  return 0
+end
+local depth = redis.call('LLEN', KEYS[1])
+  + redis.call('ZCARD', KEYS[2])
+  + redis.call('ZCARD', KEYS[3])
+if depth >= tonumber(ARGV[1]) then
+  return -1
+end
+-- LPUSH + worker RPOP preserves FIFO delivery order.
+redis.call('LPUSH', KEYS[1], ARGV[2])
+redis.call('SADD', KEYS[4], ARGV[3])
+if idempotency_ttl > 0 then
+  redis.call('SET', KEYS[5], ARGV[5], 'EX', idempotency_ttl)
+end
+return 1
+"""
 
+
+async def enqueue_message(
+    recipient_id: str,
+    text: str,
+    account_id: int,
+    delay: float = 0,
+    recipient_type: str = "user",
+    *,
+    idempotency_key: str | None = None,
+    idempotency_ttl: int | None = None,
+) -> bool:
+    if recipient_type not in {"user", "comment"}:
+        raise ValueError("Unsupported Meta recipient type")
+    client = await get_redis_client()
     queue_key = f"queue:{account_id}"
     payload = json.dumps({
         "job_id": uuid.uuid4().hex,
-        "recipient_id": recipient_id, 
-        "text": text, 
+        "recipient_id": recipient_id,
+        "recipient_type": recipient_type,
+        "text": text,
         "account_id": account_id,
         "delay": delay,
         "attempt": 0,
         "queued_at": time.time(),
     }, separators=(",", ":"), sort_keys=True)
-    
-    pipe = client.pipeline()
-    pipe.rpush(queue_key, payload)
-    pipe.sadd(ACTIVE_ACCOUNTS_KEY, str(account_id))
-    await pipe.execute()
+
+    dedupe_ttl = idempotency_ttl if idempotency_key is not None else 0
+    if dedupe_ttl is None:
+        dedupe_ttl = settings.WEBHOOK_DEDUP_TTL_SECONDS
+    if dedupe_ttl < 0:
+        raise ValueError("idempotency_ttl cannot be negative")
+    dedupe_key = (
+        f"outbound:dedupe:{stable_fingerprint(idempotency_key)}"
+        if idempotency_key is not None
+        else "outbound:dedupe:disabled"
+    )
+
+    # Capacity check, optional idempotency claim, queue insert, and active-account
+    # registration are a single Redis operation. A burst cannot overfill the cap
+    # or enqueue the same comment's private reply twice.
+    result = int(
+        await client.eval(
+            _ENQUEUE_OUTBOUND_SCRIPT,
+            5,
+            queue_key,
+            f"queue:processing:{account_id}",
+            f"queue:retry:{account_id}",
+            ACTIVE_ACCOUNTS_KEY,
+            dedupe_key,
+            settings.OUTBOUND_QUEUE_MAX_DEPTH,
+            payload,
+            account_id,
+            dedupe_ttl,
+            json.loads(payload)["job_id"],
+        )
+    )
+    if result < 0:
+        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
+    return result == 1
+
+
+async def enqueue_private_reply(comment_id: str, text: str, account_id: int, delay: float = 0) -> bool:
+    """Queue a one-time Meta private reply, idempotent per account and comment."""
+    return await enqueue_message(
+        recipient_id=comment_id,
+        text=text,
+        account_id=account_id,
+        delay=delay,
+        recipient_type="comment",
+        idempotency_key=f"private-reply:{account_id}:{comment_id}",
+        idempotency_ttl=settings.WEBHOOK_DEDUP_TTL_SECONDS,
+    )
+
+
+_ENQUEUE_AFTER_HOURS_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+local depth = redis.call('LLEN', KEYS[2])
+  + redis.call('ZCARD', KEYS[3])
+  + redis.call('ZCARD', KEYS[4])
+if depth >= tonumber(ARGV[2]) then
+  return -1
+end
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+redis.call('LPUSH', KEYS[2], ARGV[3])
+redis.call('SADD', KEYS[5], ARGV[4])
+return 1
+"""
+
+
+async def enqueue_after_hours_notice(
+    recipient_id: str,
+    text: str,
+    account_id: int,
+    delay: float = 0,
+    expiration: int = 21600,
+) -> bool:
+    """Atomically claim the cooldown and durably enqueue the customer notice."""
+    payload = json.dumps(
+        {
+            "job_id": uuid.uuid4().hex,
+            "recipient_id": recipient_id,
+            "recipient_type": "user",
+            "text": text,
+            "account_id": account_id,
+            "delay": delay,
+            "attempt": 0,
+            "queued_at": time.time(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    client = await get_redis_client()
+    result = int(
+        await client.eval(
+            _ENQUEUE_AFTER_HOURS_SCRIPT,
+            5,
+            f"after_hours_notice:{account_id}:{recipient_id}",
+            f"queue:{account_id}",
+            f"queue:processing:{account_id}",
+            f"queue:retry:{account_id}",
+            ACTIVE_ACCOUNTS_KEY,
+            expiration,
+            settings.OUTBOUND_QUEUE_MAX_DEPTH,
+            payload,
+            account_id,
+        )
+    )
+    if result == -1:
+        raise QueueBackpressure(f"Outbound queue capacity reached for account {account_id}")
+    return result == 1
 
 
 _CLAIM_OUTBOUND_SCRIPT = """
@@ -593,7 +827,7 @@ async def check_daily_conversation_limit(account_id: int, max_limit: int = 120) 
 
 async def check_reply_repetition(account_id: int, text: str, max_limit: int = 50) -> bool:
     client = await get_redis_client()
-    text_hash = hash(text)
+    text_hash = stable_fingerprint(text)
     key = f"reply_repetition:{account_id}:{text_hash}"
     current = await client.incr(key)
     if current == 1:
@@ -627,7 +861,7 @@ async def record_unknown_intent(account_id: int, text: str) -> bool:
     client = await get_redis_client()
     # Normalize text (basic)
     norm_text = text.strip().lower()[:50] # Limit length
-    text_hash = hash(norm_text)
+    text_hash = stable_fingerprint(norm_text)
     
     key = f"unknown_intent:{account_id}:{text_hash}"
     count = await client.incr(key)

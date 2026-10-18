@@ -10,6 +10,7 @@ def main_menu_keyboard():
             [InlineKeyboardButton(text="🛑 إيقاف/تفعيل النظام", callback_data="toggle_system")],
             [InlineKeyboardButton(text="👤 وضع الرد البشري", callback_data="human_mode")],
             [InlineKeyboardButton(text="💬 رد خاص للتعليقات", callback_data="comment_dm_menu")],
+            [InlineKeyboardButton(text="🕘 ساعات العمل", callback_data="business_hours_menu")],
             [InlineKeyboardButton(text="📝 تخصيص نصوص الحساب", callback_data="owner_texts_menu")],
             [
                 InlineKeyboardButton(text="📄 الشروط", callback_data="terms"),

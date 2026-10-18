@@ -458,7 +458,7 @@ async def permission_revocation_monitor():
                 await notify_account_owner(account.id, "🚨 <b>CRITICAL:</b> Instagram Permissions Revoked! Account Quarantined.")
 
 async def check_account_permissions(access_token: str) -> bool:
-    url = "https://graph.facebook.com/me/permissions"
+    url = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}/me/permissions"
     params = {"access_token": access_token}
     
     required = {"instagram_manage_messages", "pages_messaging"}

@@ -19,6 +19,9 @@ def production_settings(**overrides):
         {
             "ENV": "production",
             "SECRET_KEY": "s" * 48,
+            "POSTGRES_PASSWORD": "p" * 48,
+            "DATABASE_URL": "postgresql+asyncpg://test:" + "p" * 48 + "@localhost:5432/test",
+            "REDIS_URL": "redis://:" + "r" * 48 + "@localhost:6379/15",
             "META_APP_SECRET": "m" * 32,
             "META_VERIFY_TOKEN": "v" * 32,
             "OPS_API_TOKEN": "o" * 48,
@@ -98,6 +101,10 @@ def test_redacting_filter_removes_common_secret_forms():
         ("SECRET_KEY", "replace-with-32-plus-random-characters"),
         ("META_APP_SECRET_PREVIOUS", "x"),
         ("OPS_API_TOKEN_PREVIOUS", "x"),
+        ("POSTGRES_PASSWORD", "replace-with-random-database-password"),
+        ("DATABASE_URL", "postgresql+asyncpg://test:replace-with-random-password@localhost:5432/test"),
+        ("REDIS_URL", "redis://:replace-with-random-redis-password@localhost:6379/15"),
+        ("REDIS_URL", "redis://localhost:6379/15"),
     ],
 )
 def test_production_rejects_placeholder_or_weak_rotation_secrets(field, value):
@@ -116,3 +123,11 @@ def test_liveness_is_dependency_independent():
     response = client.get("/health/live")
     assert response.status_code == 200
     assert response.json() == {"status": "alive"}
+
+
+def test_meta_graph_api_version_is_explicit_and_validated():
+    configured = production_settings(META_GRAPH_API_VERSION="v26.0")
+    assert configured.META_GRAPH_API_VERSION == "v26.0"
+
+    with pytest.raises(ValidationError):
+        production_settings(META_GRAPH_API_VERSION="latest")

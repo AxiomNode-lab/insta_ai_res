@@ -4,7 +4,8 @@ import html
 import logging
 import asyncio
 import random
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 from multiprocessing import Event
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -21,6 +22,8 @@ from app.core.redis_utils import (
     update_last_interaction,
     is_within_24h_window,
     enqueue_message,
+    enqueue_private_reply,
+    enqueue_after_hours_notice,
     get_next_message_from_queue,
     claim_outbound_message,
     acknowledge_outbound_message,
@@ -42,14 +45,26 @@ from app.core.redis_utils import (
     get_account_behavior_state,
     is_platform_behavior_risk,
     is_trust_recovery_mode,
-    record_bot_like_start
+    record_bot_like_start,
+    stable_fingerprint,
+    normalize_timestamp_seconds,
 )
-from app.models.all_models import User, Message, MessageDirection, Account, ActivityEvent, Conversation
+from app.models.all_models import (
+    Account,
+    ActivityEvent,
+    AdminUser,
+    Conversation,
+    Message,
+    MessageDirection,
+    User,
+)
 from app.services.reply_engine import get_auto_reply, normalize_arabic
 from app.services.account_settings import (
     find_comment_dm_match,
+    get_business_hours,
     get_comment_dm_rules,
     get_owner_texts,
+    is_business_open,
 )
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,11 +76,109 @@ import time
 
 logger = logging.getLogger(__name__)
 
-GRAPH_API_URL = "https://graph.facebook.com/v19.0"
+GRAPH_API_URL = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
 
 
 class DeliveryPolicyBlocked(RuntimeError):
     pass
+
+
+class InvalidOutboundPayload(ValueError):
+    """Raised when a queued outbound job is malformed or incomplete."""
+
+
+class CrossAccountOutboundPayload(InvalidOutboundPayload):
+    """Raised when the queue payload is not owned by the worker's account."""
+
+
+def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dict:
+    """Validate a claimed queue entry before it can reach a Meta API call."""
+    try:
+        payload = json.loads(raw_data)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InvalidOutboundPayload("invalid_json") from exc
+
+    if not isinstance(payload, dict):
+        raise InvalidOutboundPayload("payload_not_object")
+
+    raw_account_id = payload.get("account_id")
+    if isinstance(raw_account_id, bool) or not (
+        isinstance(raw_account_id, int)
+        or (isinstance(raw_account_id, str) and raw_account_id.isdecimal())
+    ):
+        raise InvalidOutboundPayload("invalid_account_id")
+    try:
+        payload_account_id = int(raw_account_id)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidOutboundPayload("invalid_account_id") from exc
+    if payload_account_id != int(expected_account_id):
+        raise CrossAccountOutboundPayload("account_id_mismatch")
+
+    recipient_id = payload.get("recipient_id")
+    if not isinstance(recipient_id, str) or not recipient_id.strip():
+        raise InvalidOutboundPayload("invalid_recipient_id")
+
+    recipient_type = payload.get("recipient_type")
+    if not isinstance(recipient_type, str) or recipient_type not in {"user", "comment"}:
+        raise InvalidOutboundPayload("invalid_recipient_type")
+
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise InvalidOutboundPayload("invalid_text")
+
+    delay = payload.get("delay", 0)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+        raise InvalidOutboundPayload("invalid_delay")
+    try:
+        delay_seconds = float(delay)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidOutboundPayload("invalid_delay") from exc
+    if not math.isfinite(delay_seconds) or delay_seconds < 0:
+        raise InvalidOutboundPayload("invalid_delay")
+
+    attempt = payload.get("attempt", 0)
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise InvalidOutboundPayload("invalid_attempt")
+
+    payload["account_id"] = payload_account_id
+    payload["delay"] = delay_seconds
+    return payload
+
+
+def extract_event_text(event: dict) -> str | None:
+    """Return user-visible text or a configured Meta postback payload."""
+    message = event.get("message") or {}
+    text = message.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    quick_reply = message.get("quick_reply") or {}
+    payload = quick_reply.get("payload")
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+
+    postback = event.get("postback") or {}
+    for key in ("title", "payload"):
+        value = postback.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def build_instagram_message_payload(
+    recipient_id: str, text: str, recipient_type: str = "user"
+) -> dict:
+    if recipient_type == "user":
+        recipient = {"id": recipient_id}
+    elif recipient_type == "comment":
+        recipient = {"comment_id": recipient_id}
+    else:
+        raise ValueError("Unsupported Meta recipient type")
+    return {
+        "recipient": recipient,
+        "message": {"text": text},
+        "messaging_type": "RESPONSE",
+    }
 
 
 def _truncate_log_text(text: str, limit: int = 300) -> str:
@@ -113,8 +226,27 @@ async def get_account_by_page_id(session: AsyncSession, page_id: str) -> Account
     return result.scalar_one_or_none()
 
 # --- Live Chat Notification ---
-async def notify_live_chat(account_id: int, sender_id: str, text: str, user_name: str = "Unknown"):
+async def _tenant_live_chat_recipients(account_id: int) -> list[int]:
+    """Resolve only operators explicitly linked to the message's tenant."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(AdminUser.telegram_id).where(AdminUser.account_id == account_id)
+        )
+        return list(dict.fromkeys(result.scalars().all()))
+
+
+async def notify_live_chat(
+    account_id: int, sender_id: str, text: str, user_name: str = "Unknown"
+):
     try:
+        recipients = await _tenant_live_chat_recipients(account_id)
+        if not recipients:
+            logger.warning(
+                "Live chat notification skipped account=%s reason=no_tenant_recipients",
+                account_id,
+            )
+            return
+
         bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 رد (Live Chat)", callback_data=f"reply_to:{account_id}:{sender_id}")]
@@ -124,12 +256,14 @@ async def notify_live_chat(account_id: int, sender_id: str, text: str, user_name
             f"👤: {html.escape(user_name)} (ID: {html.escape(sender_id)})\n"
             f"📄: {html.escape(text)}"
         )
-        for admin_id in settings.ADMIN_IDS:
-            try:
-                await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML", reply_markup=keyboard)
-            except Exception as exc:
-                logger.error("Failed to notify admin error_type=%s", type(exc).__name__)
-        await bot.session.close()
+        try:
+            for admin_id in recipients:
+                try:
+                    await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML", reply_markup=keyboard)
+                except Exception as exc:
+                    logger.error("Failed to notify admin error_type=%s", type(exc).__name__)
+        finally:
+            await bot.session.close()
     except Exception as exc:
         logger.error("Live chat notification failed error_type=%s", type(exc).__name__)
 
@@ -177,19 +311,41 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
             
             if data:
                 processed_count += 1
-                msg_data = json.loads(data)
-                recipient_id = msg_data["recipient_id"]
-                text = msg_data["text"]
-                msg_account_id = msg_data.get("account_id")
-                delay = msg_data.get("delay", 0)
-                
-                # Isolation Check
-                if msg_account_id and int(msg_account_id) != int(account_id):
-                    logger.critical("Security alert: cross-account queue payload rejected")
-                    await retry_outbound_message(
-                        account_id, data, msg_data, "CrossAccountPayload", max_attempts=1
+                try:
+                    msg_data = parse_outbound_queue_payload(data, account_id)
+                except InvalidOutboundPayload as exc:
+                    error_type = (
+                        "CrossAccountPayload"
+                        if isinstance(exc, CrossAccountOutboundPayload)
+                        else "InvalidOutboundPayload"
                     )
+                    logger.error(
+                        "Rejected invalid outbound queue entry account=%s error_type=%s",
+                        account_id,
+                        error_type,
+                    )
+                    # Do not retain an untrusted/malformed body in the dead-letter queue.
+                    # It cannot be safely replayed; the keyed fingerprint is for correlation.
+                    dead_letter_summary = {
+                        "job_id": stable_fingerprint(data),
+                        "account_id": int(account_id),
+                        "attempt": 0,
+                    }
+                    await retry_outbound_message(
+                        account_id,
+                        data,
+                        dead_letter_summary,
+                        error_type,
+                        max_attempts=1,
+                    )
+                    if single_pass:
+                        return processed_count
                     continue
+
+                recipient_id = msg_data["recipient_id"]
+                recipient_type = msg_data["recipient_type"]
+                text = msg_data["text"]
+                delay = msg_data["delay"]
                 
                 # --- 5) Emergency Account Isolation Check ---
                 if await is_account_locked(account_id):
@@ -225,7 +381,9 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                         continue
                         
                 # Reliability: Conversation Lock
-                conversation_lock_token = await acquire_conversation_lock(account_id, recipient_id)
+                conversation_lock_token = await acquire_conversation_lock(
+                    account_id, f"{recipient_type}:{recipient_id}"
+                )
                 if not conversation_lock_token:
                     await retry_outbound_message(
                         account_id, data, msg_data, "ConversationBusy"
@@ -235,7 +393,13 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
 
                 try:
                     try:
-                            await send_instagram_message_api(account_id, recipient_id, text, token)
+                            await send_instagram_message_api(
+                                account_id,
+                                recipient_id,
+                                text,
+                                token,
+                                recipient_type=recipient_type,
+                            )
                     except DeliveryPolicyBlocked:
                         await retry_outbound_message(
                             account_id, data, msg_data, "DeliveryPolicyBlocked", max_attempts=1
@@ -277,7 +441,9 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
                             await session.commit()
                             
                 finally:
-                    await release_conversation_lock(account_id, recipient_id, conversation_lock_token)
+                    await release_conversation_lock(
+                        account_id, f"{recipient_type}:{recipient_id}", conversation_lock_token
+                    )
                 
                 if single_pass:
                     # In single pass (worker pool), we might process just one or a small batch
@@ -295,29 +461,21 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
             await asyncio.sleep(1.0)
     return processed_count
 
-async def send_instagram_message_api(account_id: int, recipient_id: str, text: str, access_token: str):
+async def send_instagram_message_api(
+    account_id: int,
+    recipient_id: str,
+    text: str,
+    access_token: str,
+    recipient_type: str = "user",
+):
     url = f"{GRAPH_API_URL}/me/messages"
-    
-    is_within = await is_within_24h_window(account_id, recipient_id)
-    is_human_mode = await is_human_takeover_active(account_id, recipient_id)
-    
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE"
-    }
 
-    if is_within:
-        pass
-    elif is_human_mode:
-        # 24h Compliance Lock (Even for HUMAN_AGENT)
-        # "لا يسمح بالرد حتى لو HUMAN_AGENT إلا بعد رسالة جديدة من المستخدم"
-        # This implies we check if the user sent a message recently? 
-        # is_within_24h_window means "did user send msg in last 24h".
-        # If is_within is False, it means user hasn't sent msg in last 24h.
-        # So we strictly block if !is_within.
-        raise DeliveryPolicyBlocked("Outside24HourWindow")
-    else:
+    payload = build_instagram_message_payload(recipient_id, text, recipient_type)
+
+    # A Meta Private Reply is authorized by its comment ID and is not an ordinary
+    # continuation of a Direct Messaging conversation. Ordinary DMs retain the
+    # strict 24-hour policy guard.
+    if recipient_type == "user" and not await is_within_24h_window(account_id, recipient_id):
         raise DeliveryPolicyBlocked("Outside24HourWindow")
 
     params = {
@@ -329,11 +487,24 @@ async def send_instagram_message_api(account_id: int, recipient_id: str, text: s
         try:
             response = await client.post(url, params=params, json=payload)
             response.raise_for_status()
-            logger.info("Message sent recipient=%s", _safe_subject(recipient_id))
-            # --- Track Outgoing for Silence Detection ---
+            logger.info("Message accepted by Meta recipient=%s", _safe_subject(recipient_id))
+
+            # Delivery already succeeded. Telemetry must never turn that success
+            # into a retry, which could duplicate the customer's message.
             from app.core.redis_utils import track_outgoing_message
-            await track_outgoing_message(1)
-            return response.json()
+            try:
+                await track_outgoing_message(1)
+            except Exception as metric_exc:
+                logger.warning(
+                    "Outgoing delivery metric unavailable error_type=%s",
+                    type(metric_exc).__name__,
+                )
+
+            try:
+                return response.json()
+            except ValueError:
+                logger.warning("Meta accepted message but returned a non-JSON response")
+                return {}
         except httpx.HTTPStatusError as e:
             error_message = _format_http_error(e.response)
             logger.error("Meta send failed %s", error_message)
@@ -376,7 +547,64 @@ class EventAlreadyProcessing(RuntimeError):
 
 
 def _safe_subject(value: object) -> str:
-    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+    """Create a stable, keyed pseudonym for identifiers in logs and activity details."""
+    return stable_fingerprint(str(value), length=12)
+
+
+def private_reply_comment_timestamp_allowed(
+    timestamp: object,
+    *,
+    now: datetime | None = None,
+    max_age_seconds: int = 7 * 24 * 60 * 60,
+) -> bool | None:
+    """Check Meta's private-reply window when the comment timestamp is supplied.
+
+    Returns None only when Meta did not provide a timestamp; in that case the
+    platform remains the final authority. Invalid, future, and expired supplied
+    timestamps fail closed.
+    """
+    if timestamp is None:
+        return None
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (str, int, float)):
+        return False
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current_epoch = current.timestamp()
+
+    try:
+        numeric_epoch = (
+            isinstance(timestamp, (int, float))
+            or (
+                isinstance(timestamp, str)
+                and bool(re.fullmatch(r"\d+(?:\.\d+)?", timestamp.strip()))
+            )
+        )
+        if numeric_epoch:
+            normalized = normalize_timestamp_seconds(
+                timestamp,
+                now=current_epoch,
+                future_tolerance_seconds=0,
+            )
+            if normalized is None:
+                return False
+            posted_at = datetime.fromtimestamp(normalized, tz=timezone.utc)
+        else:
+            iso_value = timestamp.strip()
+            if not iso_value:
+                return False
+            if iso_value.endswith("Z"):
+                iso_value = iso_value[:-1] + "+00:00"
+            posted_at = datetime.fromisoformat(iso_value)
+            if posted_at.tzinfo is None:
+                posted_at = posted_at.replace(tzinfo=timezone.utc)
+            posted_at = posted_at.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return False
+
+    age_seconds = (current.astimezone(timezone.utc) - posted_at).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
 
 
 async def process_comment_change(change: dict, account: Account, session: AsyncSession):
@@ -408,13 +636,38 @@ async def _process_comment_change(change: dict, account: Account, session: Async
     commenter = value.get("from") or {}
     commenter_id = commenter.get("id")
     media = value.get("media") or {}
-    media_product_type = str(media.get("media_product_type") or media.get("media_type") or "").upper()
+    media_product_type = str(media.get("media_product_type") or "").upper()
+    media_type = str(media.get("media_type") or "").upper()
 
-    if not comment_id or not comment_text or not commenter_id:
+    if not comment_id or not isinstance(comment_text, str) or not comment_text.strip() or not commenter_id:
         return
 
-    # User requested keyword private replies for video comments only.
-    if media_product_type not in {"VIDEO", "REELS", "IGTV"}:
+    comment_timestamp = value.get("timestamp")
+    timestamp_allowed = private_reply_comment_timestamp_allowed(comment_timestamp)
+    if timestamp_allowed is False:
+        session.add(
+            ActivityEvent(
+                account_id=account.id,
+                event_type="COMMENT_DM_BLOCKED",
+                details=f"reason=invalid_or_expired_timestamp comment={_safe_subject(comment_id)}",
+            )
+        )
+        await session.commit()
+        return
+    if timestamp_allowed is None:
+        logger.warning(
+            "Comment timestamp missing; relying on Meta private-reply enforcement account=%s",
+            account.id,
+        )
+
+    # This feature is intentionally scoped to video comments. Meta separates
+    # the publishing surface (media_product_type=FEED) from the media format
+    # (media_type=VIDEO), so both fields must be checked independently.
+    is_video_comment = (
+        media_product_type in {"VIDEO", "REELS", "IGTV"}
+        or (media_product_type in {"", "FEED"} and media_type == "VIDEO")
+    )
+    if not is_video_comment:
         return
 
     rules = await get_comment_dm_rules(session, account.id)
@@ -422,9 +675,7 @@ async def _process_comment_change(change: dict, account: Account, session: Async
     if not reply_text:
         return
 
-    # Comment itself is treated as a fresh user interaction to pass local 24h window guard.
-    await update_last_interaction(account.id, commenter_id, timestamp=int(time.time()))
-    await enqueue_message(commenter_id, reply_text, account.id, delay=random.uniform(2, 8))
+    await enqueue_private_reply(comment_id, reply_text, account.id, delay=random.uniform(2, 8))
 
     user = await get_or_create_user(session, commenter_id, account.id, send_welcome=False)
     session.add(
@@ -440,14 +691,15 @@ async def _process_comment_change(change: dict, account: Account, session: Async
         ActivityEvent(
             account_id=account.id,
             event_type="COMMENT_DM_TRIGGERED",
-            details=f"Keyword: {matched_keyword} | User: {commenter_id} | CommentID: {comment_id}",
+            details=f"keyword={matched_keyword} recipient={_safe_subject(commenter_id)} comment={_safe_subject(comment_id)}",
         )
     )
     await session.commit()
 
 async def process_single_event(event: dict, account: Account, session: AsyncSession):
     message = event.get("message") or {}
-    stable_id = message.get("mid")
+    postback = event.get("postback") or {}
+    stable_id = message.get("mid") or postback.get("mid")
     if not stable_id:
         stable_id = hashlib.sha256(
             json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -472,13 +724,13 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
     timestamp = event.get("timestamp")
     message = event.get("message", {})
     mid = message.get("mid")
-    text = message.get("text")
+    text = extract_event_text(event)
     is_echo = message.get("is_echo", False)
     
     if is_echo:
         if recipient_id:
             await set_human_takeover(account.id, recipient_id, active=True)
-            log = ActivityEvent(account_id=account.id, event_type="HUMAN_INTERVENTION", details=f"Admin replied to {recipient_id}")
+            log = ActivityEvent(account_id=account.id, event_type="HUMAN_INTERVENTION", details=f"recipient={_safe_subject(recipient_id)}")
             session.add(log)
             await session.commit()
             
@@ -495,17 +747,21 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
                 
         return
 
+    if not sender_id:
+        logger.warning("Webhook message missing sender")
+        return
+
     if not text:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp)
         return
         
     clean_text = re.sub(r'[^\w\s]', '', text).strip()
     if len(clean_text) <= 2:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp)
         return
         
     # --- 5) Follow-Up Cooldown Logic ---
-    text_hash = str(hash(clean_text))
+    text_hash = stable_fingerprint(clean_text)
     if await check_follow_up_cooldown(account.id, sender_id, text_hash):
         # User repeated message < 30s.
         # Don't reply immediately. Just ignore or delay?
@@ -553,7 +809,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
              pass
 
     if is_human_mode:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp)
         user = await get_or_create_user(session, sender_id, account.id)
         # --- User-Visible Diagnostics ---
         user.last_reply_status = "HUMAN_MODE_ACTIVE"
@@ -572,6 +828,54 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         await session.commit()
         return
 
+    business_hours = await get_business_hours(session, account.id)
+    if not is_business_open(business_hours):
+        if await is_rate_limited(account.id, sender_id):
+            user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+            user.last_reply_status = "RATE_LIMITED"
+            session.add(user)
+            await session.commit()
+            return
+
+        if not await check_account_limits(account.id):
+            user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+            user.last_reply_status = "PLAN_LIMIT_REACHED"
+            session.add(user)
+            await session.commit()
+            return
+
+        await update_last_interaction(
+            account.id, sender_id, timestamp=timestamp
+        )
+        user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
+        user.last_reply_status = "AFTER_HOURS"
+        session.add(user)
+        session.add(
+            Message(
+                account_id=account.id,
+                user_id=user.id,
+                content=text,
+                direction=MessageDirection.INCOMING,
+                mid=mid,
+            )
+        )
+        session.add(
+            ActivityEvent(
+                account_id=account.id,
+                event_type="AFTER_HOURS_RECEIVED",
+                details=f"sender={_safe_subject(sender_id)}",
+            )
+        )
+        await session.commit()
+        await enqueue_after_hours_notice(
+            sender_id,
+            business_hours["after_hours_text"],
+            account.id,
+            delay=random.uniform(1, 4),
+        )
+        await notify_live_chat(account.id, sender_id, text, user.full_name or "User")
+        return
+
     # --- 3) Human Escalation Rule ---
     escalation_keywords = ["أريد", "اريد", "احجز", "اطلب", "بدي", "ابغى", "شراء"]
     normalized_text = normalize_arabic(text)
@@ -579,14 +883,14 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
     
     if should_escalate:
         await set_human_takeover(account.id, sender_id, active=True)
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp)
         
         user = await get_or_create_user(session, sender_id, account.id)
         user.is_paused = True
         user.last_reply_status = "SALES_ESCALATION"
         session.add(user)
         
-        log = ActivityEvent(account_id=account.id, event_type="HUMAN_ESCALATION", details=f"Triggered by: {text}")
+        log = ActivityEvent(account_id=account.id, event_type="HUMAN_ESCALATION", details=f"reason=sales_escalation sender={_safe_subject(sender_id)}")
         session.add(log)
         await session.commit()
         
@@ -610,7 +914,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         await session.commit()
         return
 
-    await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+    await update_last_interaction(account.id, sender_id, timestamp=timestamp)
 
     user = await get_or_create_user(session, sender_id, account.id)
     
@@ -734,7 +1038,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
             sale_keywords = ["عرض", "خصم", "اطلب", "سجل", "اشتر", "تواصل", "واتساب", "whatsapp"]
             normalized_reply = normalize_arabic(reply_text)
             if any(kw in normalized_reply for kw in sale_keywords):
-                log = ActivityEvent(account_id=account.id, event_type="POLICY_BLOCKED_SALES", details=f"Blocked sales reply to new user: {reply_text[:20]}...")
+                log = ActivityEvent(account_id=account.id, event_type="POLICY_BLOCKED_SALES", details=f"reason=new_user_sales_reply reply={stable_fingerprint(reply_text)}")
                 session.add(log)
                 user.last_reply_status = "SAFETY_BLOCKED_SALES"
                 session.add(user)
@@ -755,14 +1059,14 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         # If pattern is repeating, maybe escalate
         # We tracked reply above.
         # Here we just log if diversity is low.
-        struct_hash = hash(f"{text[:10]}-{reply_text[:10]}")
+        struct_hash = stable_fingerprint(f"{text[:10]}-{reply_text[:10]}")
         if await check_conversation_diversity(account.id, str(struct_hash)):
             # Escalation
             if random.random() < 0.3:
                  await set_human_takeover(account.id, sender_id, True)
                  return
 
-        lock_key = f"outgoing:{account.id}:{sender_id}:{hash(reply_text)}"
+        lock_key = f"outgoing:{account.id}:{sender_id}:{stable_fingerprint(reply_text)}"
         if await acquire_queue_lock(lock_key):
             try:
                 # --- 4) Random Response Timing ---
@@ -866,7 +1170,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         is_suggested = await record_unknown_intent(account.id, text)
         if is_suggested:
             # Notify Admin
-             log = ActivityEvent(account_id=account.id, event_type="INTENT_SUGGESTION", details=f"Frequent unknown: {text}")
+             log = ActivityEvent(account_id=account.id, event_type="INTENT_SUGGESTION", details=f"unknown_intent_fingerprint={stable_fingerprint(text)}")
              session.add(log)
              await session.commit()
 
@@ -886,7 +1190,7 @@ async def get_or_create_user(
         await session.commit()
         await session.refresh(user)
         
-        log = ActivityEvent(account_id=account_id, event_type="NEW_USER", details=f"IG: {ig_id}")
+        log = ActivityEvent(account_id=account_id, event_type="NEW_USER", details=f"instagram_user={_safe_subject(ig_id)}")
         session.add(log)
         await session.commit()
         if send_welcome:

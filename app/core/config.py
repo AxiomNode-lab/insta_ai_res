@@ -2,6 +2,8 @@ from typing import List, Union
 from pydantic import AnyHttpUrl, PostgresDsn, RedisDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
+import re
+from urllib.parse import unquote, urlsplit
 
 class Settings(BaseSettings):
     PROJECT_NAME: str
@@ -41,6 +43,7 @@ class Settings(BaseSettings):
     META_APP_SECRET: str
     META_APP_SECRET_PREVIOUS: str | None = None
     META_VERIFY_TOKEN: str
+    META_GRAPH_API_VERSION: str = "v26.0"
     INSTAGRAM_ACCESS_TOKEN: str
     INSTAGRAM_PAGE_ID: str
 
@@ -78,6 +81,13 @@ class Settings(BaseSettings):
             except json.JSONDecodeError:
                 return []
         return v
+
+    @field_validator("META_GRAPH_API_VERSION")
+    @classmethod
+    def validate_meta_graph_api_version(cls, value: str) -> str:
+        if not re.fullmatch(r"v[1-9]\d*\.0", value):
+            raise ValueError("META_GRAPH_API_VERSION must look like v26.0")
+        return value
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
@@ -128,6 +138,41 @@ class Settings(BaseSettings):
             if len(value.strip()) < minimum
             or any(fragment in value.lower() for fragment in forbidden_fragments)
         ]
+
+        # The data-service credentials are production secrets too. Validate both
+        # the component value and the effective URL so a strong component value
+        # cannot mask a weak password embedded in DATABASE_URL.
+        postgres_password = self.POSTGRES_PASSWORD.strip()
+        if (
+            len(postgres_password) < 24
+            or any(fragment in postgres_password.lower() for fragment in forbidden_fragments)
+        ):
+            invalid.append("POSTGRES_PASSWORD")
+
+        try:
+            database_password = unquote(urlsplit(str(self.DATABASE_URL)).password or "")
+        except ValueError:
+            database_password = ""
+        if (
+            len(database_password.strip()) < 24
+            or any(fragment in database_password.lower() for fragment in forbidden_fragments)
+        ):
+            invalid.append("DATABASE_URL")
+
+        try:
+            redis_parts = urlsplit(self.REDIS_URL)
+            redis_password = unquote(redis_parts.password or "")
+            redis_url_valid = redis_parts.scheme in {"redis", "rediss"} and bool(redis_parts.hostname)
+        except ValueError:
+            redis_password = ""
+            redis_url_valid = False
+        if (
+            not redis_url_valid
+            or len(redis_password.strip()) < 24
+            or any(fragment in redis_password.lower() for fragment in forbidden_fragments)
+        ):
+            invalid.append("REDIS_URL")
+
         if invalid:
             raise ValueError(
                 "Insecure production secret configuration: " + ", ".join(sorted(invalid))

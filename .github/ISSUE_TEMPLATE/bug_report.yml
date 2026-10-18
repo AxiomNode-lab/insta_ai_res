@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible defect without including customer data or credentials.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Never paste access tokens, webhook payloads, customer messages, database exports,
+        or Redis contents. Use synthetic identifiers and redacted logs.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Meta webhook
+        - Outbound delivery/queue
+        - Telegram operator bot
+        - Business hours
+        - Docker/deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected and actual behavior using synthetic data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      placeholder: Numbered steps, sanitized request shape, or a small test case.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Version or commit
+      placeholder: Commit SHA or release tag
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: OS, Python, Docker/Compose, PostgreSQL, and Redis versions
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, tokens, customer messages, webhook bodies, and stable customer identifiers.
+          required: true

@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">IG Reply Desk</title>
+  <desc id="desc">Secure and durable Instagram support automation with recoverable queues and human handoff.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090d1f"/>
+      <stop offset="0.55" stop-color="#151238"/>
+      <stop offset="1" stop-color="#32104d"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff3d81"/>
+      <stop offset="0.5" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#36c5f0"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="640" rx="36" fill="url(#bg)"/>
+  <circle cx="1070" cy="100" r="190" fill="#a855f7" opacity="0.16" filter="url(#glow)"/>
+  <circle cx="180" cy="600" r="230" fill="#36c5f0" opacity="0.1" filter="url(#glow)"/>
+
+  <g transform="translate(88 88)">
+    <rect width="88" height="88" rx="24" fill="url(#accent)"/>
+    <path d="M24 28h40a10 10 0 0 1 10 10v22a10 10 0 0 1-10 10H45L30 80v-10h-6a10 10 0 0 1-10-10V38a10 10 0 0 1 10-10Z" fill="#fff" opacity="0.98"/>
+    <circle cx="34" cy="49" r="4" fill="#8b3cf6"/>
+    <circle cx="45" cy="49" r="4" fill="#8b3cf6"/>
+    <circle cx="56" cy="49" r="4" fill="#8b3cf6"/>
+  </g>
+
+  <text x="88" y="248" fill="#ffffff" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="72" font-weight="750" letter-spacing="-2">IG Reply Desk</text>
+  <text x="88" y="310" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="28">Secure, durable Instagram support automation</text>
+  <text x="88" y="354" fill="#94a3b8" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="20">Signed webhooks · Recoverable queues · Human handoff</text>
+
+  <g font-family="Inter,Segoe UI,Arial,sans-serif" font-size="17" font-weight="600">
+    <rect x="88" y="410" width="170" height="46" rx="23" fill="#ffffff" opacity="0.09" stroke="#ffffff" stroke-opacity="0.12"/>
+    <text x="116" y="440" fill="#f8fafc">Meta-native</text>
+    <rect x="272" y="410" width="188" height="46" rx="23" fill="#ffffff" opacity="0.09" stroke="#ffffff" stroke-opacity="0.12"/>
+    <text x="300" y="440" fill="#f8fafc">Multi-tenant</text>
+    <rect x="474" y="410" width="188" height="46" rx="23" fill="#ffffff" opacity="0.09" stroke="#ffffff" stroke-opacity="0.12"/>
+    <text x="502" y="440" fill="#f8fafc">Privacy-aware</text>
+  </g>
+
+  <g transform="translate(790 170)" font-family="Inter,Segoe UI,Arial,sans-serif">
+    <rect width="390" height="300" rx="30" fill="#0f172a" opacity="0.88" stroke="#ffffff" stroke-opacity="0.12"/>
+    <text x="36" y="52" fill="#94a3b8" font-size="15" font-weight="700" letter-spacing="2">MESSAGE FLOW</text>
+    <g font-size="18" font-weight="650">
+      <rect x="36" y="78" width="318" height="48" rx="14" fill="#1e293b"/>
+      <circle cx="62" cy="102" r="8" fill="#36c5f0"/>
+      <text x="84" y="109" fill="#f8fafc">Verified Meta webhook</text>
+      <path d="M195 126v18" stroke="#64748b" stroke-width="2"/>
+      <path d="m189 139 6 7 6-7" fill="none" stroke="#64748b" stroke-width="2"/>
+      <rect x="36" y="146" width="318" height="48" rx="14" fill="#1e293b"/>
+      <circle cx="62" cy="170" r="8" fill="#a855f7"/>
+      <text x="84" y="177" fill="#f8fafc">Durable Redis queue</text>
+      <path d="M195 194v18" stroke="#64748b" stroke-width="2"/>
+      <path d="m189 207 6 7 6-7" fill="none" stroke="#64748b" stroke-width="2"/>
+      <rect x="36" y="214" width="318" height="48" rx="14" fill="#1e293b"/>
+      <circle cx="62" cy="238" r="8" fill="#ff3d81"/>
+      <text x="84" y="245" fill="#f8fafc">Reply or human handoff</text>
+    </g>
+  </g>
+</svg>

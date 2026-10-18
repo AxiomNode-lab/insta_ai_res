@@ -11,10 +11,14 @@ from app.core.config import settings
 from app.core.security import get_admin_role, log_admin_action
 from app.services.account_settings import (
     delete_comment_dm_rule,
+    get_business_hours,
     get_comment_dm_rules,
     get_owner_texts,
     reset_owner_text,
     set_owner_text,
+    set_after_hours_text,
+    set_business_hours,
+    set_business_hours_enabled,
     upsert_comment_dm_rule,
 )
 from app.core.redis_utils import (
@@ -60,6 +64,10 @@ class CommentRuleState(StatesGroup):
 class OwnerTextState(StatesGroup):
     entering_value = State()
 
+class BusinessHoursState(StatesGroup):
+    entering_schedule = State()
+    entering_after_hours_text = State()
+
 OWNER_TEXT_LABELS = {
     "welcome_text": "رسالة الترحيب لأول مستخدم جديد",
     "fallback_text": "رسالة عدم فهم النية (Fallback)",
@@ -80,6 +88,16 @@ def owner_texts_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✏️ تعديل رسالة Fallback", callback_data="owner_text_edit:fallback_text")],
         [InlineKeyboardButton(text="✏️ تعديل التحية الخفيفة", callback_data="owner_text_edit:soft_welcome_text")],
         [InlineKeyboardButton(text="🔄 تحديث", callback_data="owner_texts_menu")],
+        [InlineKeyboardButton(text="⬅️ رجوع", callback_data="main_menu")],
+    ])
+
+def business_hours_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ تعطيل ساعات العمل" if enabled else "▶️ تفعيل ساعات العمل"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data="business_hours_toggle")],
+        [InlineKeyboardButton(text="🗓 تعديل الجدول", callback_data="business_hours_schedule")],
+        [InlineKeyboardButton(text="✏️ تعديل رد خارج الدوام", callback_data="business_hours_text")],
+        [InlineKeyboardButton(text="🔄 تحديث", callback_data="business_hours_menu")],
         [InlineKeyboardButton(text="⬅️ رجوع", callback_data="main_menu")],
     ])
 
@@ -104,6 +122,18 @@ def _build_owner_texts_summary(owner_texts: dict[str, str]) -> str:
     for key, label in OWNER_TEXT_LABELS.items():
         rows.append(f"• {label}: {html.escape(_truncate_text(owner_texts[key], 70))}")
     return "\n".join(rows)
+
+def _build_business_hours_summary(config: dict) -> str:
+    day_names = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+    days = "، ".join(day_names[day] for day in config["days"])
+    status = "مفعّلة ✅" if config["enabled"] else "معطّلة ⏸"
+    return (
+        f"• الحالة: {status}\n"
+        f"• المنطقة: <code>{html.escape(config['timezone'])}</code>\n"
+        f"• الأيام: {days}\n"
+        f"• الوقت: <code>{config['open']}–{config['close']}</code>\n"
+        f"• رد خارج الدوام: {html.escape(_truncate_text(config['after_hours_text'], 100))}"
+    )
 
 async def check_permission(message: Message, required_roles: list[AdminRole]) -> bool:
     telegram_id = message.from_user.id
@@ -824,6 +854,12 @@ async def comment_dm_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "comment_dm_add")
 async def comment_dm_add_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     await state.set_state(CommentRuleState.entering_keyword)
     await callback.message.answer(
         "✏️ أرسل الكلمة المفتاحية التي يجب التقاطها من التعليق.",
@@ -833,6 +869,12 @@ async def comment_dm_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CommentRuleState.entering_keyword)
 async def comment_dm_receive_keyword(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     keyword = (message.text or "").strip()
     if not keyword:
         await message.answer("⚠️ الكلمة المفتاحية لا يمكن أن تكون فارغة.")
@@ -860,7 +902,12 @@ async def comment_dm_receive_response(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
@@ -883,6 +930,12 @@ async def comment_dm_receive_response(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "comment_dm_delete")
 async def comment_dm_delete_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     await state.set_state(CommentRuleState.deleting_keyword)
     await callback.message.answer(
         "🗑 أرسل الكلمة المفتاحية التي تريد حذف قاعدتها.",
@@ -898,7 +951,12 @@ async def comment_dm_delete_execute(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
@@ -919,6 +977,177 @@ async def comment_dm_delete_execute(message: Message, state: FSMContext):
     status = "✅ تم حذف القاعدة." if deleted else "ℹ️ لم يتم العثور على هذه الكلمة."
     text = f"{status}\n\n💬 <b>القواعد الحالية:</b>\n{_build_comment_rules_summary(rules)}"
     await message.answer(text, parse_mode="HTML", reply_markup=comment_dm_menu_keyboard())
+
+# --- Business Hours ---
+@router.callback_query(F.data == "business_hours_menu")
+async def business_hours_menu(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if not acc_id:
+            await callback.answer("⚠️ لا يوجد حساب مرتبط.")
+            return
+        config = await get_business_hours(session, acc_id)
+
+    text = "🕘 <b>ساعات العمل</b>\n\n" + _build_business_hours_summary(config)
+    text += "\n\nخارج الدوام تُحفظ الرسالة، يُبلّغ الفريق، ويُرسل رد واحد خلال كل 6 ساعات."
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=business_hours_menu_keyboard(config["enabled"]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "business_hours_toggle")
+async def business_hours_toggle(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if not acc_id:
+            await callback.answer("⚠️ لا يوجد حساب مرتبط.")
+            return
+        current = await get_business_hours(session, acc_id)
+        config = await set_business_hours_enabled(session, acc_id, not current["enabled"])
+        await session.commit()
+        await log_admin_action(
+            session,
+            callback.from_user.id,
+            "business_hours_toggle",
+            f"enabled={config['enabled']}",
+        )
+
+    await callback.message.edit_text(
+        "🕘 <b>ساعات العمل</b>\n\n" + _build_business_hours_summary(config),
+        parse_mode="HTML",
+        reply_markup=business_hours_menu_keyboard(config["enabled"]),
+    )
+    await callback.answer("✅ تم تحديث الحالة.")
+
+
+@router.callback_query(F.data == "business_hours_schedule")
+async def business_hours_schedule_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+    await state.set_state(BusinessHoursState.entering_schedule)
+    await callback.message.answer(
+        "أرسل الجدول بهذا الشكل:\n"
+        "<code>Europe/Istanbul 0,1,2,3,4 09:00 18:00</code>\n\n"
+        "الأيام: 0=الإثنين وحتى 6=الأحد. ويدعم الدوام الذي يتجاوز منتصف الليل.",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(BusinessHoursState.entering_schedule)
+async def business_hours_schedule_save(message: Message, state: FSMContext):
+    parts = (message.text or "").split()
+    if len(parts) != 4:
+        await message.answer("⚠️ استخدم: المنطقة الأيام وقت_الفتح وقت_الإغلاق")
+        return
+    timezone_name, raw_days, opens, closes = parts
+    try:
+        days = sorted({int(day) for day in raw_days.split(",")})
+    except ValueError:
+        await message.answer("⚠️ الأيام يجب أن تكون أرقاماً من 0 إلى 6 مفصولة بفواصل.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.")
+            return
+        acc_id = await get_admin_account_id(session, message.from_user.id)
+        if not acc_id:
+            await state.clear()
+            await message.answer("⚠️ لا يوجد حساب مرتبط.")
+            return
+        try:
+            config = await set_business_hours(
+                session,
+                acc_id,
+                timezone_name=timezone_name,
+                days=days,
+                opens=opens,
+                closes=closes,
+            )
+        except ValueError as exc:
+            await message.answer(f"⚠️ إعداد غير صالح: {html.escape(str(exc))}")
+            return
+        await session.commit()
+        await log_admin_action(
+            session,
+            message.from_user.id,
+            "business_hours_schedule_update",
+            f"timezone={timezone_name} days={days} open={opens} close={closes}",
+        )
+
+    await state.clear()
+    await message.answer(
+        "✅ تم حفظ الجدول.\n\n" + _build_business_hours_summary(config),
+        parse_mode="HTML",
+        reply_markup=business_hours_menu_keyboard(config["enabled"]),
+    )
+
+
+@router.callback_query(F.data == "business_hours_text")
+async def business_hours_text_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+    await state.set_state(BusinessHoursState.entering_after_hours_text)
+    await callback.message.answer(
+        "✏️ أرسل الرد الذي يصل للعميل خارج ساعات العمل.",
+        reply_markup=cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(BusinessHoursState.entering_after_hours_text)
+async def business_hours_text_save(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("⚠️ النص لا يمكن أن يكون فارغاً.")
+        return
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.")
+            return
+        acc_id = await get_admin_account_id(session, message.from_user.id)
+        if not acc_id:
+            await state.clear()
+            await message.answer("⚠️ لا يوجد حساب مرتبط.")
+            return
+        config = await set_after_hours_text(session, acc_id, value)
+        await session.commit()
+        await log_admin_action(
+            session,
+            message.from_user.id,
+            "after_hours_text_update",
+            "text_updated=true",
+        )
+
+    await state.clear()
+    await message.answer(
+        "✅ تم حفظ الرد.\n\n" + _build_business_hours_summary(config),
+        parse_mode="HTML",
+        reply_markup=business_hours_menu_keyboard(config["enabled"]),
+    )
 
 # --- Owner Texts ---
 @router.callback_query(F.data == "owner_texts_menu")
@@ -944,6 +1173,12 @@ async def owner_texts_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("owner_text_edit:"))
 async def owner_text_edit_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
     key = callback.data.split(":", 1)[1]
     if key not in OWNER_TEXT_LABELS:
         await callback.answer("⚠️ إعداد غير صالح.")
@@ -970,7 +1205,12 @@ async def owner_text_edit_save(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
@@ -1012,7 +1252,17 @@ async def start_add_reply(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("type_"))
 async def process_type(callback: CallbackQuery, state: FSMContext):
-    match_type = callback.data.split("_")[1]
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await state.clear()
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+    match_type = callback.data.split("_", 1)[1]
+    if match_type not in {"exact", "keyword", "fallback"}:
+        await callback.answer("⚠️ نوع الرد غير صالح.")
+        return
     await state.update_data(match_type=match_type)
     
     if match_type == "fallback":
@@ -1026,7 +1276,17 @@ async def process_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AddReplyState.entering_keyword)
 async def process_keyword(message: Message, state: FSMContext):
-    await state.update_data(keyword=message.text)
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
+    keyword = (message.text or "").strip()
+    if not keyword:
+        await message.answer("⚠️ الكلمة المفتاحية لا يمكن أن تكون فارغة.")
+        return
+    await state.update_data(keyword=keyword)
     await state.set_state(AddReplyState.entering_response)
     await message.answer("✏️ أدخل نص الرد:", reply_markup=cancel_keyboard())
 
@@ -1039,11 +1299,20 @@ async def process_response(message: Message, state: FSMContext):
     elif m_type_str == "fallback": match_type_enum = MatchType.FALLBACK
     
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
         if not acc_id:
-             await message.answer("⚠️ خطأ: لا يوجد حساب مرتبط.")
-             await state.clear()
-             return
+            await message.answer("⚠️ خطأ: لا يوجد حساب مرتبط.")
+            await state.clear()
+            return
+        if not data.get("match_type") or not data.get("keyword") or not (message.text or "").strip():
+            await state.clear()
+            await message.answer("⚠️ بيانات الرد غير مكتملة. ابدأ من جديد.", reply_markup=main_menu_keyboard())
+            return
 
         new_reply = AutoReply(
             account_id=acc_id,
@@ -1119,15 +1388,33 @@ async def toggle_system(callback: CallbackQuery):
 # --- Human Mode (Pause User) ---
 @router.callback_query(F.data == "human_mode")
 async def human_mode_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة الوضع البشري.")
+            return
     await state.set_state(PauseUserState.entering_id)
     await callback.message.edit_text("أدخل معرف مستخدم إنستغرام (IG ID) لإيقاف/تفعيل الرد الآلي له:", reply_markup=cancel_keyboard())
 
 @router.message(PauseUserState.entering_id)
 async def process_pause_user(message: Message, state: FSMContext):
-    ig_id = message.text.strip()
-    
+    ig_id = (message.text or "").strip()
+    if not ig_id:
+        await message.answer("⚠️ أدخل معرف مستخدم صالحاً.")
+        return
+
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة الوضع البشري.", reply_markup=main_menu_keyboard())
+            return
+        if not acc_id:
+            await state.clear()
+            await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
+            return
         stmt = select(User).where(User.ig_id == ig_id, User.account_id == acc_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
