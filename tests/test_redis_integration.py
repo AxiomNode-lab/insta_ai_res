@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -7,6 +8,7 @@ from app.core.redis_utils import (
     QueueBackpressure,
     close_redis_pool,
     enqueue_after_hours_notice,
+    enqueue_message,
     get_redis_client,
 )
 
@@ -49,6 +51,43 @@ async def test_after_hours_notice_is_atomic_and_capacity_bounded(monkeypatch):
             *keys,
             f"after_hours_notice:{account_id}:synthetic-user-2",
         )
+        await client.srem("active_accounts_set", str(account_id))
+        await client.aclose()
+        await close_redis_pool()
+
+
+
+@pytest.mark.asyncio
+async def test_outbound_queue_capacity_is_atomic_under_concurrent_writers(monkeypatch):
+    account_id = 991_338
+    queue_key = f"queue:{account_id}"
+    processing_key = f"queue:processing:{account_id}"
+    retry_key = f"queue:retry:{account_id}"
+    client = await get_redis_client()
+    monkeypatch.setattr(settings, "OUTBOUND_QUEUE_MAX_DEPTH", 1)
+
+    try:
+        await client.delete(queue_key, processing_key, retry_key)
+        await client.srem("active_accounts_set", str(account_id))
+
+        async def enqueue(index: int) -> bool:
+            try:
+                await enqueue_message(
+                    recipient_id=f"synthetic-recipient-{index}",
+                    text="Synthetic queue-capacity test",
+                    account_id=account_id,
+                )
+                return True
+            except QueueBackpressure:
+                return False
+
+        accepted = await asyncio.gather(*(enqueue(index) for index in range(12)))
+
+        assert sum(accepted) == 1
+        assert await client.llen(queue_key) == 1
+        assert await client.sismember("active_accounts_set", str(account_id))
+    finally:
+        await client.delete(queue_key, processing_key, retry_key)
         await client.srem("active_accounts_set", str(account_id))
         await client.aclose()
         await close_redis_pool()
