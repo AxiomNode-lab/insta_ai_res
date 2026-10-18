@@ -579,13 +579,20 @@ async def _process_comment_change(change: dict, account: Account, session: Async
     commenter = value.get("from") or {}
     commenter_id = commenter.get("id")
     media = value.get("media") or {}
-    media_product_type = str(media.get("media_product_type") or media.get("media_type") or "").upper()
+    media_product_type = str(media.get("media_product_type") or "").upper()
+    media_type = str(media.get("media_type") or "").upper()
 
-    if not comment_id or not comment_text or not commenter_id:
+    if not comment_id or not isinstance(comment_text, str) or not comment_text.strip() or not commenter_id:
         return
 
-    # User requested keyword private replies for video comments only.
-    if media_product_type not in {"VIDEO", "REELS", "IGTV"}:
+    # This feature is intentionally scoped to video comments. Meta separates
+    # the publishing surface (media_product_type=FEED) from the media format
+    # (media_type=VIDEO), so both fields must be checked independently.
+    is_video_comment = (
+        media_product_type in {"VIDEO", "REELS", "IGTV"}
+        or (media_product_type in {"", "FEED"} and media_type == "VIDEO")
+    )
+    if not is_video_comment:
         return
 
     rules = await get_comment_dm_rules(session, account.id)
