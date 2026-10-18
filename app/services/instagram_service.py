@@ -670,12 +670,12 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         return
 
     if not text:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp or None)
         return
         
     clean_text = re.sub(r'[^\w\s]', '', text).strip()
     if len(clean_text) <= 2:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp or None)
         return
         
     # --- 5) Follow-Up Cooldown Logic ---
@@ -727,7 +727,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
              pass
 
     if is_human_mode:
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp or None)
         user = await get_or_create_user(session, sender_id, account.id)
         # --- User-Visible Diagnostics ---
         user.last_reply_status = "HUMAN_MODE_ACTIVE"
@@ -763,7 +763,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
             return
 
         await update_last_interaction(
-            account.id, sender_id, timestamp=int(timestamp) if timestamp else None
+            account.id, sender_id, timestamp=timestamp or None
         )
         user = await get_or_create_user(session, sender_id, account.id, send_welcome=False)
         user.last_reply_status = "AFTER_HOURS"
@@ -801,7 +801,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
     
     if should_escalate:
         await set_human_takeover(account.id, sender_id, active=True)
-        await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+        await update_last_interaction(account.id, sender_id, timestamp=timestamp or None)
         
         user = await get_or_create_user(session, sender_id, account.id)
         user.is_paused = True
@@ -832,7 +832,7 @@ async def _process_single_event(event: dict, account: Account, session: AsyncSes
         await session.commit()
         return
 
-    await update_last_interaction(account.id, sender_id, timestamp=int(timestamp) if timestamp else None)
+    await update_last_interaction(account.id, sender_id, timestamp=timestamp or None)
 
     user = await get_or_create_user(session, sender_id, account.id)
     
