@@ -16,7 +16,9 @@ from app.core.config import settings
 config = context.config
 
 # Set sqlalchemy.url from app config
-config.set_main_option("sqlalchemy.url", str(settings.DATABASE_URL))
+# ConfigParser treats percent signs as interpolation markers. Escape them here so
+# URL-encoded characters in database passwords survive into SQLAlchemy unchanged.
+config.set_main_option("sqlalchemy.url", str(settings.DATABASE_URL).replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
