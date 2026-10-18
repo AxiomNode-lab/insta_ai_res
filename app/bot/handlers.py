@@ -1167,6 +1167,12 @@ async def owner_texts_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("owner_text_edit:"))
 async def owner_text_edit_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
     key = callback.data.split(":", 1)[1]
     if key not in OWNER_TEXT_LABELS:
         await callback.answer("⚠️ إعداد غير صالح.")
@@ -1193,7 +1199,12 @@ async def owner_text_edit_save(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
@@ -1235,7 +1246,17 @@ async def start_add_reply(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("type_"))
 async def process_type(callback: CallbackQuery, state: FSMContext):
-    match_type = callback.data.split("_")[1]
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await state.clear()
+            await callback.answer("⛔ ليس لديك صلاحية.")
+            return
+    match_type = callback.data.split("_", 1)[1]
+    if match_type not in {"exact", "keyword", "fallback"}:
+        await callback.answer("⚠️ نوع الرد غير صالح.")
+        return
     await state.update_data(match_type=match_type)
     
     if match_type == "fallback":
@@ -1249,7 +1270,17 @@ async def process_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AddReplyState.entering_keyword)
 async def process_keyword(message: Message, state: FSMContext):
-    await state.update_data(keyword=message.text)
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
+    keyword = (message.text or "").strip()
+    if not keyword:
+        await message.answer("⚠️ الكلمة المفتاحية لا يمكن أن تكون فارغة.")
+        return
+    await state.update_data(keyword=keyword)
     await state.set_state(AddReplyState.entering_response)
     await message.answer("✏️ أدخل نص الرد:", reply_markup=cancel_keyboard())
 
@@ -1262,11 +1293,20 @@ async def process_response(message: Message, state: FSMContext):
     elif m_type_str == "fallback": match_type_enum = MatchType.FALLBACK
     
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية.", reply_markup=main_menu_keyboard())
+            return
         if not acc_id:
-             await message.answer("⚠️ خطأ: لا يوجد حساب مرتبط.")
-             await state.clear()
-             return
+            await message.answer("⚠️ خطأ: لا يوجد حساب مرتبط.")
+            await state.clear()
+            return
+        if not data.get("match_type") or not data.get("keyword") or not (message.text or "").strip():
+            await state.clear()
+            await message.answer("⚠️ بيانات الرد غير مكتملة. ابدأ من جديد.", reply_markup=main_menu_keyboard())
+            return
 
         new_reply = AutoReply(
             account_id=acc_id,
