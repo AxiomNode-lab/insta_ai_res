@@ -4,6 +4,7 @@ import html
 import logging
 import asyncio
 import random
+import math
 from datetime import datetime
 from multiprocessing import Event
 from app.core.config import settings
@@ -79,6 +80,64 @@ GRAPH_API_URL = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
 
 class DeliveryPolicyBlocked(RuntimeError):
     pass
+
+
+class InvalidOutboundPayload(ValueError):
+    """Raised when a queued outbound job is malformed or incomplete."""
+
+
+class CrossAccountOutboundPayload(InvalidOutboundPayload):
+    """Raised when the queue payload is not owned by the worker's account."""
+
+
+def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dict:
+    """Validate a claimed queue entry before it can reach a Meta API call."""
+    try:
+        payload = json.loads(raw_data)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InvalidOutboundPayload("invalid_json") from exc
+
+    if not isinstance(payload, dict):
+        raise InvalidOutboundPayload("payload_not_object")
+
+    raw_account_id = payload.get("account_id")
+    if isinstance(raw_account_id, bool) or raw_account_id is None:
+        raise InvalidOutboundPayload("missing_account_id")
+    try:
+        payload_account_id = int(raw_account_id)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidOutboundPayload("invalid_account_id") from exc
+    if payload_account_id != int(expected_account_id):
+        raise CrossAccountOutboundPayload("account_id_mismatch")
+
+    recipient_id = payload.get("recipient_id")
+    if not isinstance(recipient_id, str) or not recipient_id.strip():
+        raise InvalidOutboundPayload("invalid_recipient_id")
+
+    recipient_type = payload.get("recipient_type")
+    if recipient_type not in {"user", "comment"}:
+        raise InvalidOutboundPayload("invalid_recipient_type")
+
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise InvalidOutboundPayload("invalid_text")
+
+    delay = payload.get("delay", 0)
+    if (
+        isinstance(delay, bool)
+        or not isinstance(delay, (int, float))
+        or not math.isfinite(delay)
+        or delay < 0
+    ):
+        raise InvalidOutboundPayload("invalid_delay")
+
+    attempt = payload.get("attempt", 0)
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise InvalidOutboundPayload("invalid_attempt")
+
+    payload["account_id"] = payload_account_id
+    payload["delay"] = float(delay)
+    return payload
 
 
 def extract_event_text(event: dict) -> str | None:
@@ -247,20 +306,41 @@ async def process_outgoing_queue(account_id: int = None, stop_event: Event = Non
             
             if data:
                 processed_count += 1
-                msg_data = json.loads(data)
-                recipient_id = msg_data["recipient_id"]
-                recipient_type = msg_data.get("recipient_type", "user")
-                text = msg_data["text"]
-                msg_account_id = msg_data.get("account_id")
-                delay = msg_data.get("delay", 0)
-                
-                # Isolation Check
-                if msg_account_id and int(msg_account_id) != int(account_id):
-                    logger.critical("Security alert: cross-account queue payload rejected")
-                    await retry_outbound_message(
-                        account_id, data, msg_data, "CrossAccountPayload", max_attempts=1
+                try:
+                    msg_data = parse_outbound_queue_payload(data, account_id)
+                except InvalidOutboundPayload as exc:
+                    error_type = (
+                        "CrossAccountPayload"
+                        if isinstance(exc, CrossAccountOutboundPayload)
+                        else "InvalidOutboundPayload"
                     )
+                    logger.error(
+                        "Rejected invalid outbound queue entry account=%s error_type=%s",
+                        account_id,
+                        error_type,
+                    )
+                    # Do not retain an untrusted/malformed body in the dead-letter queue.
+                    # It cannot be safely replayed; the keyed fingerprint is for correlation.
+                    dead_letter_summary = {
+                        "job_id": stable_fingerprint(data),
+                        "account_id": int(account_id),
+                        "attempt": 0,
+                    }
+                    await retry_outbound_message(
+                        account_id,
+                        data,
+                        dead_letter_summary,
+                        error_type,
+                        max_attempts=1,
+                    )
+                    if single_pass:
+                        return processed_count
                     continue
+
+                recipient_id = msg_data["recipient_id"]
+                recipient_type = msg_data["recipient_type"]
+                text = msg_data["text"]
+                delay = msg_data["delay"]
                 
                 # --- 5) Emergency Account Isolation Check ---
                 if await is_account_locked(account_id):
