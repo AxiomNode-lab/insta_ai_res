@@ -869,6 +869,12 @@ async def comment_dm_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CommentRuleState.entering_keyword)
 async def comment_dm_receive_keyword(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     keyword = (message.text or "").strip()
     if not keyword:
         await message.answer("⚠️ الكلمة المفتاحية لا يمكن أن تكون فارغة.")
@@ -1382,15 +1388,33 @@ async def toggle_system(callback: CallbackQuery):
 # --- Human Mode (Pause User) ---
 @router.callback_query(F.data == "human_mode")
 async def human_mode_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة الوضع البشري.")
+            return
     await state.set_state(PauseUserState.entering_id)
     await callback.message.edit_text("أدخل معرف مستخدم إنستغرام (IG ID) لإيقاف/تفعيل الرد الآلي له:", reply_markup=cancel_keyboard())
 
 @router.message(PauseUserState.entering_id)
 async def process_pause_user(message: Message, state: FSMContext):
-    ig_id = message.text.strip()
-    
+    ig_id = (message.text or "").strip()
+    if not ig_id:
+        await message.answer("⚠️ أدخل معرف مستخدم صالحاً.")
+        return
+
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة الوضع البشري.", reply_markup=main_menu_keyboard())
+            return
+        if not acc_id:
+            await state.clear()
+            await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
+            return
         stmt = select(User).where(User.ig_id == ig_id, User.account_id == acc_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
