@@ -146,6 +146,7 @@ The default suite uses synthetic payloads and mocked external boundaries. CI add
 
 ## Documentation
 
+- [Project architecture and file guide (Arabic)](docs/PROJECT_FILE_GUIDE.md)
 - [Roadmap](ROADMAP.md)
 - [Operations runbook](RUNBOOK.md)
 - [Threat model](docs/THREAT_MODEL.md)
