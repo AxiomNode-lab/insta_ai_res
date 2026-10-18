@@ -123,12 +123,13 @@ def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dic
         raise InvalidOutboundPayload("invalid_text")
 
     delay = payload.get("delay", 0)
-    if (
-        isinstance(delay, bool)
-        or not isinstance(delay, (int, float))
-        or not math.isfinite(delay)
-        or delay < 0
-    ):
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+        raise InvalidOutboundPayload("invalid_delay")
+    try:
+        delay_seconds = float(delay)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidOutboundPayload("invalid_delay") from exc
+    if not math.isfinite(delay_seconds) or delay_seconds < 0:
         raise InvalidOutboundPayload("invalid_delay")
 
     attempt = payload.get("attempt", 0)
@@ -136,7 +137,7 @@ def parse_outbound_queue_payload(raw_data: str, expected_account_id: int) -> dic
         raise InvalidOutboundPayload("invalid_attempt")
 
     payload["account_id"] = payload_account_id
-    payload["delay"] = float(delay)
+    payload["delay"] = delay_seconds
     return payload
 
 
