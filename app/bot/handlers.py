@@ -854,6 +854,12 @@ async def comment_dm_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "comment_dm_add")
 async def comment_dm_add_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     await state.set_state(CommentRuleState.entering_keyword)
     await callback.message.answer(
         "✏️ أرسل الكلمة المفتاحية التي يجب التقاطها من التعليق.",
@@ -890,7 +896,12 @@ async def comment_dm_receive_response(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
@@ -913,6 +924,12 @@ async def comment_dm_receive_response(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "comment_dm_delete")
 async def comment_dm_delete_start(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, callback.from_user.id)
+        acc_id = await get_admin_account_id(session, callback.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER] or not acc_id:
+            await callback.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
     await state.set_state(CommentRuleState.deleting_keyword)
     await callback.message.answer(
         "🗑 أرسل الكلمة المفتاحية التي تريد حذف قاعدتها.",
@@ -928,7 +945,12 @@ async def comment_dm_delete_execute(message: Message, state: FSMContext):
         return
 
     async with AsyncSessionLocal() as session:
+        role = await get_admin_role(session, message.from_user.id)
         acc_id = await get_admin_account_id(session, message.from_user.id)
+        if role not in [AdminRole.OWNER, AdminRole.MANAGER]:
+            await state.clear()
+            await message.answer("⛔ ليس لديك صلاحية لإدارة قواعد التعليقات.")
+            return
         if not acc_id:
             await state.clear()
             await message.answer("⚠️ لا يوجد حساب مرتبط.", reply_markup=main_menu_keyboard())
