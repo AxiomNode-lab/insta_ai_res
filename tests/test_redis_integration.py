@@ -10,6 +10,8 @@ from app.core.redis_utils import (
     check_account_limits,
     enqueue_after_hours_notice,
     enqueue_message,
+    enqueue_private_reply,
+    stable_fingerprint,
     get_redis_client,
 )
 
@@ -93,6 +95,41 @@ async def test_outbound_queue_capacity_is_atomic_under_concurrent_writers(monkey
         await client.aclose()
         await close_redis_pool()
 
+
+
+@pytest.mark.asyncio
+async def test_private_reply_is_idempotent_and_outbound_queue_is_fifo(monkeypatch):
+    account_id = 991_340
+    comment_id = "synthetic-comment-991340"
+    queue_key = f"queue:{account_id}"
+    processing_key = f"queue:processing:{account_id}"
+    retry_key = f"queue:retry:{account_id}"
+    dedupe_key = f"outbound:dedupe:{stable_fingerprint(f'private-reply:{account_id}:{comment_id}')}"
+    client = await get_redis_client()
+    monkeypatch.setattr(settings, "OUTBOUND_QUEUE_MAX_DEPTH", 10)
+
+    try:
+        await client.delete(queue_key, processing_key, retry_key, dedupe_key)
+        await client.srem("active_accounts_set", str(account_id))
+
+        assert await enqueue_private_reply(comment_id, "Synthetic private reply", account_id)
+        assert not await enqueue_private_reply(comment_id, "Duplicate synthetic reply", account_id)
+        await enqueue_message("fifo-first", "first", account_id)
+        await enqueue_message("fifo-second", "second", account_id)
+
+        assert await client.llen(queue_key) == 3
+        import json
+
+        delivered_order = [
+            json.loads(await client.rpop(queue_key))["recipient_id"]
+            for _ in range(3)
+        ]
+        assert delivered_order == [comment_id, "fifo-first", "fifo-second"]
+    finally:
+        await client.delete(queue_key, processing_key, retry_key, dedupe_key)
+        await client.srem("active_accounts_set", str(account_id))
+        await client.aclose()
+        await close_redis_pool()
 
 
 @pytest.mark.asyncio
