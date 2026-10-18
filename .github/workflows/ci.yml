@@ -157,5 +157,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate production Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.prod.yml config --quiet
+          rm -f .env
+
       - name: Build production image
         run: docker build --pull --tag ig-reply-desk:ci .
